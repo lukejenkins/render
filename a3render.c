@@ -7,13 +7,15 @@
  *
  * This tool reads an ATSC 3.0 PCAP file, finds UDP packets containing LLS
  * and ROUTE data, decompresses gzipped XML payloads, and parses the XML to
-
  * generate a human-readable HTML report.
  *
- * Author: Gemini
+ * Author: Mark J. Colombo, along with Google Gemini and Anthropic Claude
  *
  *****************************************************************************/
 #define _GNU_SOURCE // For memmem
+
+#define RENDER_VERSION "0.2.0"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,20 +42,7 @@
 #include "esg.h"
 #include "bps.h"
 #include "utility.h"
-
-// --- To enable verbose MMT packet debugging, set to 1 ---
-#define DEBUG_MMT 0
-
-// MMT packet types
-#define MMT_PACKET_TYPE_IPV4 0x0
-#define MMT_PACKET_TYPE_IPV6 0x1
-#define MMT_PACKET_TYPE_GFP  0x2
-#define MMT_PACKET_TYPE_HEADER_COMPRESSION 0x3
-
-// MMT payload types
-#define MMT_PAYLOAD_TYPE_MPU 0x0
-#define MMT_PAYLOAD_TYPE_GENERIC_OBJECT 0x1
-#define MMT_PAYLOAD_TYPE_SIGNALING_MESSAGE 0x2
+#include "mmt.h"
 
 // LMT specific constants
 #define LMT_TABLE_ID 0x01
@@ -77,6 +66,7 @@ typedef struct LmtService {
     uint16_t plp_id;
     char service_name[64];
     LmtMulticast* multicasts;
+    int duplicate_count;
     struct LmtService* next;
 } LmtService;
 
@@ -84,31 +74,9 @@ typedef struct {
     uint8_t lmt_version;
     uint8_t num_services;
     LmtService* services;
+    int duplicate_count;
+    int total_entry_count; 
 } LmtData;
-
-// --- Data Structures for Parsed XML ---
-// For SLT: A single service entry
-typedef struct ServiceInfo {
-    char serviceId[16];
-    char majorChannelNo[16];
-    char minorChannelNo[16];
-    char shortServiceName[64];
-    char globalServiceID[128];
-    char slsDestinationIpAddress[40];
-    char slsDestinationUdpPort[16];
-    char slsSourceIpAddress[40];
-    char slsProtocol[8];
-    char slsMmtpPacketId[16];
-    char slsMajorProtocolVersion[8];
-    char slsMinorProtocolVersion[8];
-    char serviceCategory[8];
-    char sltSvcSeqNum[8];
-    int protected;
-    int broadbandAccessRequired;
-    int hidden;
-    int hideInGuide;
-    struct ServiceInfo* next;
-} ServiceInfo;
 
 // For SLT: Holds the list of all services
 typedef struct {
@@ -246,47 +214,6 @@ typedef struct {
     MpdAdaptationSet* head_as;
 } MpdData;
 
-// Enhanced MPT structures
-typedef struct MptAssetDescriptor {
-    uint8_t descriptor_tag;
-    uint8_t descriptor_length;
-    uint8_t* descriptor_data;
-    struct MptAssetDescriptor* next;
-} MptAssetDescriptor;
-
-typedef struct MptAssetLocation {
-    uint8_t location_type;
-    uint16_t packet_id;
-    struct MptAssetLocation* next;
-} MptAssetLocation;
-
-typedef struct MptAssetInfo {
-    char asset_id[256];
-    uint8_t asset_id_length;
-    char asset_type[64];
-    uint8_t asset_type_length;
-    uint8_t asset_clock_relation_flag;
-    uint8_t location_count;
-    MptAssetLocation* locations;
-    uint8_t descriptor_count;
-    MptAssetDescriptor* descriptors;
-    struct MptAssetInfo* next;
-} MptAssetInfo;
-
-typedef struct MptMessageData {
-    uint8_t table_id;
-    uint8_t version;
-    uint16_t length;
-    uint16_t mmt_package_id_length;
-    char mmt_package_id[256];
-    uint8_t mpt_mode;
-    uint8_t mpu_timestamp_descriptor;
-    uint8_t num_of_assets;
-    MptAssetInfo* assets;
-    uint8_t descriptor_count;
-    MptAssetDescriptor* descriptors;
-} MptMessageData;
-
 typedef struct {
     char bbandEntryPageUrl[512];
     char clearBbandEntryPageUrl[512];
@@ -305,45 +232,6 @@ typedef struct UsdEntry {
 typedef struct {
     UsdEntry* head;
 } UserServiceDescriptionData;
-
-// --- For BundleDescriptionMMT ---
-typedef struct UsdEntryMmt {
-    char id[128];
-    char contentType[128];
-    char version[16];
-    struct UsdEntryMmt* next;
-} UsdEntryMmt;
-
-typedef struct {
-    UsdEntryMmt* head;
-} UsdbData;
-
-typedef struct UsdAsset {
-    char assetId[128];
-    char assetType[64];  // "video", "audio", "data", etc.
-    char role[64];       // "main", "alternate", "supplementary"
-    char lang[16];       // Language code
-    struct UsdAsset* next;
-} UsdAsset;
-
-typedef struct UsdComponent {
-    char componentId[128];
-    int componentType;    // 0=audio, 1=video, 2=data
-    int componentRole;    // 0=main, 1=alternate, etc.
-    char description[256]; // Derived description
-    struct UsdComponent* next;
-} UsdComponent;
-
-typedef struct UsdData {
-    char serviceId[64];
-    char serviceName[256];
-    char serviceDescription[512];
-    char serviceCategory[16];
-    char globalServiceId[128];
-    char mmtPackageId[128];
-    UsdComponent* components;
-    UsdAsset* assets;
-} UsdData;
 
 // For metadataEnvelope (Service Signaling)
 typedef struct ServiceSignalingFragment {
@@ -377,31 +265,6 @@ typedef struct {
     StsidLogicalStream* head_ls;
 } StsidData;
 
-// For MMT MP Table
-typedef struct MptAsset {
-    char assetId[256];
-    char assetType[64];
-    char packetId[16];
-    struct MptAsset* next;
-} MptAsset;
-
-typedef struct {
-    char mptPackageId[256];
-    MptAsset* head_asset;
-} MpTableData;
-
-typedef struct BinaryMptAsset {
-    char assetId[256];
-    char assetType[64];
-    char codec[64];
-    uint16_t packetId;
-    struct BinaryMptAsset* next;
-} BinaryMptAsset;
-
-typedef struct {
-    BinaryMptAsset* head_asset;
-} BinaryMptData;
-
 typedef struct DwdData {
     char placeholder[32]; // Not fully parsed, just acknowledged
 } DwdData;
@@ -418,88 +281,11 @@ typedef struct ReassemblyBuffer {
     struct ReassemblyBuffer* next;
 } ReassemblyBuffer;
 
-typedef struct {
-    uint8_t version;
-    uint8_t packet_counter_flag;
-    uint8_t fec_type;
-    uint8_t extension_flag;
-    uint8_t rap_flag;
-    uint16_t packet_id;
-    uint32_t timestamp;
-    uint32_t packet_sequence_number;
-    uint16_t packet_counter;
-    
-    // Payload information
-    uint8_t payload_type;
-    uint32_t payload_length;
-    
-    // Header extensions if present
-    uint16_t extension_type;
-    uint16_t extension_length;
-    uint8_t* extension_data;
-} mmt_packet_header_t;
-
-// MMT signaling message types
-#define MMT_SIGNALING_PA_MESSAGE 0x0000
-#define MMT_SIGNALING_MPI_MESSAGE 0x0001
-#define MMT_SIGNALING_MPT_MESSAGE 0x0002
-#define MMT_SIGNALING_CRI_MESSAGE 0x0003
-#define MMT_SIGNALING_DCI_MESSAGE 0x0004
-#define MMT_SIGNALING_SSWR_MESSAGE 0x0005
-#define MMT_SIGNALING_AL_FEC_MESSAGE 0x0006
-#define MMT_SIGNALING_HRBM_MESSAGE 0x0007
-#define MMT_SIGNALING_MC_MESSAGE 0x0008
-#define MMT_SIGNALING_AC_MESSAGE 0x0009
-#define MMT_SIGNALING_AF_MESSAGE 0x000A
-#define MMT_SIGNALING_RQF_MESSAGE 0x000B
-#define MMT_SIGNALING_ADC_MESSAGE 0x000C
-#define MMT_SIGNALING_HRB_REMOVAL_MESSAGE 0x000D
-#define MMT_SIGNALING_LS_MESSAGE 0x000E
-#define MMT_SIGNALING_LR_MESSAGE 0x000F
-#define MMT_SIGNALING_NAMF_MESSAGE 0x0010
-#define MMT_SIGNALING_LDC_MESSAGE 0x0011
-
-// Enhanced MMT signaling message structure
-typedef struct {
-    uint16_t message_id;
-    uint8_t version;
-    uint32_t length;
-    uint8_t* payload;
-} mmt_signaling_message_t;
-
-// New structure for this proprietary MPT format
-typedef struct ProprietaryMptAsset {
-    uint32_t asset_id_length;
-    char asset_id[256];
-    uint16_t packet_id;
-    char codec[64];
-    char asset_type[64];
-    struct ProprietaryMptAsset* next;
-} ProprietaryMptAsset;
-
-typedef struct ProprietaryMptData {
-    uint8_t table_id;
-    uint8_t version;
-    uint16_t length;
-    char package_descriptor[256];
-    uint8_t num_assets;
-    ProprietaryMptAsset* assets;
-} ProprietaryMptData;
-
-// MPU header structure
-typedef struct {
-    uint32_t mpu_sequence_number;
-    uint8_t fragmentation_indicator;
-    uint8_t fragment_type;
-    const uint8_t* mfu_data;
-    size_t mfu_data_length;
-} MpuHeader;
-
 // --- Global Variables ---
-static int g_packet_count = 0;
+int g_packet_count = 0;
 static int g_link_type;
-static LlsTable g_lls_tables[MAX_TABLES];
-static int g_lls_table_count = 0;
+LlsTable g_lls_tables[MAX_TABLES];
+int g_lls_table_count = 0;
 static ServiceDestination g_service_dests[MAX_SERVICES];
 static int g_service_dest_count = 0;
 static ReassemblyBuffer* g_reassembly_head = NULL;
@@ -511,14 +297,8 @@ static int g_pcap_timing_valid = 0;
 static DataUsageEntry g_data_usage[MAX_DATA_STREAMS];
 static int g_data_usage_count = 0;
 static uint64_t g_total_capture_bytes = 0;
+static int g_route_packet_count_196810 = 0;
 static BpsData* g_bps_data = NULL;
-
-// --- Global variables for MMT Packet ID logging ---
-static PacketIdLog g_packet_id_log[MAX_UNIQUE_PIDS];
-static int g_packet_id_log_count = 0;
-static bool packet_id_seen[65536] = {false}; // Track first occurrence of each packet ID
-static MmtMediaParamsCache g_mmt_params_cache[100];
-static int g_mmt_params_cache_count = 0;
 
 // --- Function Prototypes ---
 void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *packet);
@@ -535,22 +315,9 @@ void store_unique_table(const char* content, int len, TableType type, void* pars
 void generate_html_report(const char* filename);
 int is_gzip_complete(const uint8_t* buffer, size_t size);
 int is_xml_complete(const char* buffer, size_t size);
-void process_mmt_signaling_payload(const uint8_t* buffer, size_t size, const char* destIp, const char* destPort);
 void cleanup();
 
-void log_mmt_packet_id(uint16_t packet_id);
 void print_packet_id_log();
-
-BinaryMptData* parse_binary_mp_table_multiformat(const uint8_t* buffer, size_t size);
-int parse_mmt_packet_header(const uint8_t* buffer, size_t length, mmt_packet_header_t* header);
-int parse_mmt_signaling_message(const uint8_t* buffer, size_t length, mmt_signaling_message_t* message);
-void process_mmt_signaling_message(mmt_signaling_message_t* message, const char* destIp, const char* destPort);
-void free_mmt_packet_header(mmt_packet_header_t* header);
-void process_enhanced_mmt_payload(const u_char* payload, int len, ServiceDestination* dest_info);
-void process_enhanced_mmt_signaling_payload(const uint8_t* buffer, size_t size, const char* destIp, const char* destPort);
-BinaryMptData* parse_enhanced_binary_mp_table(const uint8_t* buffer, size_t size);
-void free_mpt_message_data(MptMessageData* mpt);
-void free_proprietary_mpt_data(ProprietaryMptData* mpt);
 
 void process_multi_document_xml(const char* xml_data, size_t size, const char* destIp, const char* destPort, const char* source_id);
 void remove_functionally_duplicate_tables();
@@ -563,7 +330,6 @@ const char* get_media_type_from_mpt(const char* dest_ip, const char* dest_port, 
 const char* get_extended_stream_description(const char* dest_ip, const char* dest_port, uint32_t id, const char* stream_type);
 const char* get_service_name_for_destination(const char* dest_ip, const char* dest_port);
 int is_likely_route_packet(const uint8_t* payload, int len);
-int is_likely_mmt_packet(const uint8_t* payload, int len);
 int is_likely_rtp_packet(const uint8_t* payload, int len);
 const char* infer_content_type_from_context(const char* dest_ip, const char* dest_port, uint32_t id, const char* stream_type);
 void reclassify_data_usage_after_slt();
@@ -615,9 +381,17 @@ void free_reassembly_buffers();
 
 // --- Main Function ---
 int main(int argc, char *argv[]) {
+    // Check for version flag first
+    if (argc == 2 && (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0)) {
+        printf("RENDER - RabbitEars NextGen Data Evaluator and Reporter v%s\n", RENDER_VERSION);
+        printf("ATSC 3.0 LLS and ROUTE/DASH Signaling parser\n");
+        return 0;
+    }
+    
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <pcap_file_or_debug_file>\n", argv[0]);
-        fprintf(stderr, "\nSupported file types:\n");
+        fprintf(stderr, "       %s -v|--version\n\n", argv[0]);
+        fprintf(stderr, "Supported file types:\n");
         fprintf(stderr, "  .pcap/.pcapng - Standard PCAP capture files\n");
         fprintf(stderr, "  .dbg - ATSC 3.0 debug files\n");
         fprintf(stderr, "  ALP-PCAP files (detected by filename containing 'alp')\n");
@@ -748,11 +522,15 @@ int main(int argc, char *argv[]) {
     }
 
     // --- Process any remaining open (incomplete) ROUTE/MMT objects ---
+    printf("\n--- Processing finished. Processing any remaining open ROUTE/MMT objects. ---\n");
 
     ReassemblyBuffer* current_buf = g_reassembly_head;
     int buffer_count = 0;
     while(current_buf != NULL) {
         buffer_count++;
+        printf("\n-> Buffer %d: TSI/TOI=%u/%u on %s:%s. Total size: %zu.\n", 
+            buffer_count, current_buf->tsi, current_buf->toi, current_buf->destinationIp, 
+            current_buf->destinationPort, current_buf->size);
         
         // Skip buffers that are too small (likely just a header fragment)
         if (current_buf->size < 100) {
@@ -771,6 +549,21 @@ int main(int argc, char *argv[]) {
                 boundary_marker, strlen(boundary_marker));
             
             if (boundary_loc) {
+                printf("   Processing complete MIME multipart (close flag was never set)\n");
+                
+                // Extract boundary string for processing
+                const char* boundary_start = (const char*)(boundary_loc + strlen(boundary_marker));
+                const char* boundary_end = strchr(boundary_start, '"');
+                if (boundary_end) {
+                    size_t boundary_len = boundary_end - boundary_start;
+                    char boundary_str[256];
+                    snprintf(boundary_str, sizeof(boundary_str), "--%.*s", (int)boundary_len, boundary_start);
+                    
+                    // Process as MIME multipart - this will extract and store the MPD, S-TSID, etc.
+                    process_mime_object(current_buf->toi, current_buf->buffer, current_buf->size, 
+                                    boundary_str, current_buf->destinationIp, current_buf->destinationPort);
+                }
+                
                 current_buf = current_buf->next;
                 continue;
             }
@@ -790,9 +583,12 @@ int main(int argc, char *argv[]) {
         }
         
         if (!looks_valid) {
+            printf("   Skipping - doesn't look like valid content\n");
             current_buf = current_buf->next;
             continue;
         }
+        
+        printf("   Force processing incomplete buffer...\n");
         
         int is_route = 0;
         for(int i=0; i< g_service_dest_count; i++) {
@@ -828,6 +624,7 @@ int main(int argc, char *argv[]) {
 
     printf("\nFinished processing %s file.\n", (input_type == INPUT_TYPE_DEBUG) ? "debug" : "PCAP");
     print_packet_id_log();
+    print_mmt_message_stats();
 
     reclassify_data_usage_after_slt();
     
@@ -981,6 +778,66 @@ void update_packet_timing(const struct pcap_pkthdr *pkthdr) {
     }
 }
 
+int lmt_multicast_equals(LmtMulticast* a, LmtMulticast* b) {
+    return (a->src_ip == b->src_ip &&
+            a->dest_ip == b->dest_ip &&
+            a->src_port == b->src_port &&
+            a->dest_port == b->dest_port &&
+            a->sid_bit == b->sid_bit &&
+            a->compression_bit == b->compression_bit);
+}
+
+int remove_lmt_duplicates(LmtData* lmt, int* duplicate_count) {
+    if (!lmt || !lmt->services) return 0;
+    
+    *duplicate_count = 0;
+    int unique_count = 0;
+    
+    LmtService* current_service = lmt->services;
+    while (current_service) {
+        current_service->duplicate_count = 0;  // Initialize per-service counter
+        
+        LmtMulticast* current_mc = current_service->multicasts;
+        LmtMulticast* prev_mc = NULL;
+        
+        while (current_mc) {
+            // Check if this multicast is a duplicate of any previous one in this service
+            int is_duplicate = 0;
+            LmtMulticast* check_mc = current_service->multicasts;
+            
+            while (check_mc != current_mc) {
+                if (lmt_multicast_equals(check_mc, current_mc)) {
+                    is_duplicate = 1;
+                    (*duplicate_count)++;
+                    current_service->duplicate_count++;  // Increment per-service counter
+                    break;
+                }
+                check_mc = check_mc->next;
+            }
+            
+            if (is_duplicate) {
+                // Remove this duplicate entry
+                if (prev_mc) {
+                    prev_mc->next = current_mc->next;
+                } else {
+                    current_service->multicasts = current_mc->next;
+                }
+                LmtMulticast* to_free = current_mc;
+                current_mc = current_mc->next;
+                free(to_free);
+            } else {
+                unique_count++;
+                prev_mc = current_mc;
+                current_mc = current_mc->next;
+            }
+        }
+        
+        current_service = current_service->next;
+    }
+    
+    return unique_count;
+}
+
 LmtData* parse_lmt(const u_char* data, int len) {
     
     if (!data) {
@@ -1025,6 +882,10 @@ LmtData* parse_lmt(const u_char* data, int len) {
     
     // Parse each service (which corresponds to a PLP)
     for (int svc_idx = 0; svc_idx <= num_svc_minus1; svc_idx++) {
+        for (int i = 0; i < 13 && pos + i < len; i++) {
+            printf("%02x ", data[pos + i]);
+        }
+        printf("\n");
         
         if (pos >= len - 2) {
             break;
@@ -1042,10 +903,10 @@ LmtData* parse_lmt(const u_char* data, int len) {
         uint8_t num_multicasts = data[pos++];
         
         // Sanity check on multicast count
-        if (num_multicasts > 10) {  // Reasonable upper limit
+        /*if (num_multicasts > 40) {  // Reasonable upper limit
             printf("ERROR: Suspicious multicast count %d for PLP %d\n", num_multicasts, plp_id);
             break;
-        }
+        }*/
         
         // Check if we have enough data for all multicasts
         size_t needed_bytes = num_multicasts * 13;  // 13 bytes per multicast minimum
@@ -1193,6 +1054,37 @@ LmtData* parse_lmt(const u_char* data, int len) {
         lmt->num_services++;
     }
     
+    printf("LMT parsing complete: %d PLPs found\n", lmt->num_services);
+    
+    int duplicate_count = 0;
+    int total_entries = 0;
+    
+    // First count total entries before deduplication
+    LmtService* count_svc = lmt->services;
+    while (count_svc) {
+        LmtMulticast* count_mc = count_svc->multicasts;
+        while (count_mc) {
+            total_entries++;
+            count_mc = count_mc->next;
+        }
+        count_svc = count_svc->next;
+    }
+    
+    int unique_count = remove_lmt_duplicates(lmt, &duplicate_count);
+    
+    if (duplicate_count > 0) {
+        printf("WARNING: LMT contains %d duplicate entries (showing %d unique entries)\n", 
+               duplicate_count, unique_count);
+    }
+    
+    // Sanity check on unique count instead of raw count
+    if (unique_count > 100) {
+        printf("WARNING: Suspiciously high number of unique LMT entries: %d\n", unique_count);
+    }
+    
+    lmt->duplicate_count = duplicate_count;
+    lmt->total_entry_count = total_entries;
+    
     return lmt;
 }
 
@@ -1201,6 +1093,11 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
     alp_packet_count++;
     
     g_packet_count++;
+    
+    // ADD THIS
+    printf("=== PACKET %d ===\n", g_packet_count);
+    // END DEBUG
+    
     update_packet_timing(pkthdr);
     
     if (g_link_type == DLT_ATSC_ALP) {
@@ -1212,10 +1109,31 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
                                     &ip_payload, &ip_len, 
                                     &signaling_payload, &signaling_len);
         
+        // Suppress Sony manufacturer packets that fail to parse
+        if (result < 0 && pkthdr->caplen < 7) {
+            return;  // Skip to next packet
+        }
+        
+        // ADD THIS DEBUG
+        printf("DEBUG ALP PARSE: result=%d, ip_len=%d, signaling_len=%d\n", result, ip_len, signaling_len);
+        if (result == 0 && ip_payload && ip_len >= 20) {
+            const struct ip *ip_hdr = (struct ip*)ip_payload;
+            char debug_dst[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &ip_hdr->ip_dst, debug_dst, sizeof(debug_dst));
+            
+            if (ip_hdr->ip_p == IPPROTO_UDP && ip_len >= 20 + 8) {
+                const struct udphdr *udp = (struct udphdr*)((u_char*)ip_hdr + (ip_hdr->ip_hl * 4));
+                printf("DEBUG ALP PARSE: IPv4 UDP to %s:%d\n", debug_dst, ntohs(udp->uh_dport));
+            }
+        }
+        // END DEBUG
+
+        
         if (result == 0 && ip_payload) {
             // Process IP packet using existing logic
             const struct ip *ip_header = (struct ip*)ip_payload;
             if (!ip_header) {
+                printf("DEBUG: NULL ip_header in ALP packet %d\n", g_packet_count);
                 return;
             }
             
@@ -1227,8 +1145,15 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
 
             const struct udphdr *udp_header = (struct udphdr*)((u_char*)ip_header + ip_header_len);
             if (!udp_header) {
+                printf("DEBUG: NULL udp_header in ALP packet %d\n", g_packet_count);
                 return;
             }
+            printf("DEBUG: sizeof(struct udphdr) = %zu\n", sizeof(struct udphdr));
+            printf("DEBUG: udp_header bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                ((u_char*)udp_header)[0], ((u_char*)udp_header)[1], 
+                ((u_char*)udp_header)[2], ((u_char*)udp_header)[3],
+                ((u_char*)udp_header)[4], ((u_char*)udp_header)[5],
+                ((u_char*)udp_header)[6], ((u_char*)udp_header)[7]);
             
             const u_char *udp_payload = (u_char*)udp_header + sizeof(struct udphdr);
             int udp_payload_len = ntohs(udp_header->uh_ulen) - sizeof(struct udphdr);
@@ -1304,6 +1229,7 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
                     if (udp_payload_len >= 12) {
                         packet_id = ntohs(*(uint16_t*)(udp_payload + 10));
                     }
+                    printf("DEBUG: MMT PID=%u\n", packet_id);
                     
                     const char* description = get_stream_description(dest_ip_str, dest_port_str, packet_id);
                     if (!description) {
@@ -1361,6 +1287,7 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
 
     ip_header = (struct ip*)ip_packet_start;
     if (!ip_header) {
+        printf("DEBUG: NULL ip_header at packet %d\n", g_packet_count);
         return;
     }
     
@@ -1372,6 +1299,7 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
 
     udp_header = (struct udphdr*)((u_char*)ip_header + ip_header_len);
     if (!udp_header) {
+        printf("DEBUG: NULL udp_header at packet %d\n", g_packet_count);
         return;
     }
     
@@ -1444,6 +1372,7 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
             }
             
             record_data_usage(dest_ip_str, dest_port_str, packet_id, payload_len, description);
+            printf("DEBUG: About to call process_enhanced_mmt_payload with dest_info=%p\n", dest_info);
             process_enhanced_mmt_payload(payload, payload_len, dest_info);
         }
     } else {
@@ -1567,21 +1496,6 @@ int is_likely_route_packet(const uint8_t* payload, int len) {
     return 0;
 }
 
-int is_likely_mmt_packet(const uint8_t* payload, int len) {
-    if (len < 12) return 0;
-    
-    // Check for MMT packet header patterns
-    uint8_t version = (payload[0] >> 6) & 0x3;
-    uint16_t packet_id = ntohs(*(uint16_t*)(payload + 10));
-    
-    // MMT version should be 0, packet ID should be reasonable
-    if (version == 0 && packet_id < 8192) {
-        return 1;
-    }
-    
-    return 0;
-}
-
 int is_likely_rtp_packet(const uint8_t* payload, int len) {
     if (len < 12) return 0;
     
@@ -1686,61 +1600,6 @@ const char* get_media_type_from_stsid(const char* dest_ip, const char* dest_port
     }
     
     //printf("DEBUG S-TSID LOOKUP: No S-TSID table found for %s:%s\n", dest_ip, dest_port);
-    return "Media";
-}
-
-const char* get_media_type_from_mpt(const char* dest_ip, const char* dest_port, uint32_t packet_id) {
-    // Search through MP Table data (both XML and binary)
-    for (int i = 0; i < g_lls_table_count; i++) {
-        if ((g_lls_tables[i].type == TABLE_TYPE_MP_TABLE_XML ||
-             g_lls_tables[i].type == TABLE_TYPE_MP_TABLE_BINARY) &&
-            strcmp(g_lls_tables[i].destinationIp, dest_ip) == 0 &&
-            strcmp(g_lls_tables[i].destinationPort, dest_port) == 0) {
-            
-            if (g_lls_tables[i].type == TABLE_TYPE_MP_TABLE_XML) {
-                MpTableData* mpt_data = (MpTableData*)g_lls_tables[i].parsed_data;
-                MptAsset* asset = mpt_data->head_asset;
-                
-                while (asset) {
-                    if (atoi(asset->packetId) == packet_id) {
-                        // Check asset type and ID for clues
-                        if (strstr(asset->assetType, "video") || strstr(asset->assetId, "video") ||
-                            strstr(asset->assetId, "Video") || strstr(asset->assetId, "hev") ||
-                            strstr(asset->assetId, "hvc")) {
-                            return "Video";
-                        } else if (strstr(asset->assetType, "audio") || strstr(asset->assetId, "audio") ||
-                                   strstr(asset->assetId, "Audio") || strstr(asset->assetId, "ac-4") ||
-                                   strstr(asset->assetId, "mp4a")) {
-                            return "Audio";
-                        } else if (strstr(asset->assetType, "data") || strstr(asset->assetId, "Data") ||
-                                   strstr(asset->assetId, "stpp") || strstr(asset->assetId, "cc")) {
-                            return "Data/Captions";
-                        }
-                        return asset->assetType;
-                    }
-                    asset = asset->next;
-                }
-            } else if (g_lls_tables[i].type == TABLE_TYPE_MP_TABLE_BINARY) {
-                // CHANGED: Use ProprietaryMptData instead of BinaryMptData
-                ProprietaryMptData* mpt_data = (ProprietaryMptData*)g_lls_tables[i].parsed_data;
-                ProprietaryMptAsset* asset = mpt_data->assets;
-                
-                while (asset) {
-                    if (asset->packet_id == packet_id) {  // FIXED: packet_id not packetId
-                        return asset->asset_type;  // FIXED: asset_type not assetType
-                    }
-                    asset = asset->next;
-                }
-            }
-        }
-    }
-    
-    // Fallback - guess based on packet ID patterns (common convention)
-    if (packet_id == 0) return "Signaling";
-    if (packet_id >= 256 && packet_id <= 511) return "Video";
-    if (packet_id >= 512 && packet_id <= 767) return "Audio";
-    if (packet_id >= 768) return "Data/Captions";
-    
     return "Media";
 }
 
@@ -2026,9 +1885,25 @@ int normalize_xml_content(const char* xml_content, char* normalized_buffer, size
             if (version_end) {
                 // Replace version number with placeholder
                 memmove(version_start + 9, version_end, strlen(version_end) + 1);
-                memcpy(version_start, "XXXXXXXXX", 9); // Fixed length placeholder
+                memcpy(version_start, "XXXXXXXXX", 9);
             }
             version_start = strstr(version_end ? version_end : normalized_buffer, "version=\"");
+        }
+    }
+    
+    // Normalize afdt:efdtVersion attribute
+    char* pos = normalized_buffer;
+    while ((pos = strstr(pos, "afdt:efdtVersion=\"")) != NULL) {
+        pos += 18; // Skip 'afdt:efdtVersion="'
+        char* end_quote = strchr(pos, '"');
+        if (end_quote) {
+            // Replace version number with X's
+            while (pos < end_quote) {
+                *pos = 'X';
+                pos++;
+            }
+        } else {
+            break;
         }
     }
     
@@ -2164,6 +2039,8 @@ int is_functionally_equivalent(const char* content1, const char* content2) {
 void remove_functionally_duplicate_tables() {
     int removed_count = 0;
     
+    printf("Starting enhanced deduplication...\n");
+    
     for (int i = 0; i < g_lls_table_count; i++) {
         if (!g_lls_tables[i].content_id) continue;
         
@@ -2180,6 +2057,7 @@ void remove_functionally_duplicate_tables() {
             
             // Check for exact duplicates
             if (len_i == len_j && strcmp(g_lls_tables[i].content_id, g_lls_tables[j].content_id) == 0) {
+                printf("Found exact duplicate: type=%d, removing entry %d\n", g_lls_tables[i].type, j);
                 free(g_lls_tables[j].content_id);
                 free_parsed_data(&g_lls_tables[j]);
                 g_lls_tables[j].content_id = NULL;
@@ -2199,7 +2077,12 @@ void remove_functionally_duplicate_tables() {
                 if (is_prefix) {
                     // Keep the longer (more complete) one
                     int remove_index = (len_i < len_j) ? i : j;
+                    int keep_index = (len_i >= len_j) ? i : j;
                     
+                    printf("Found truncated duplicate: type=%d, keeping longer version (len=%zu), removing shorter (len=%zu)\n", 
+                           g_lls_tables[i].type, 
+                           strlen(g_lls_tables[keep_index].content_id),
+                           strlen(g_lls_tables[remove_index].content_id));
                     
                     free(g_lls_tables[remove_index].content_id);
                     free_parsed_data(&g_lls_tables[remove_index]);
@@ -2214,6 +2097,8 @@ void remove_functionally_duplicate_tables() {
             }
             
             if (is_functionally_equivalent(g_lls_tables[i].content_id, g_lls_tables[j].content_id)) {
+                printf("DEBUG DEDUP: Found functionally equivalent tables at i=%d, j=%d, type=%d\n", 
+                        i, j, g_lls_tables[i].type);
                 // Determine which one to keep (prefer more recent timestamp if available)
                 int remove_index = i; // Default: keep the NEWER one (j), remove the older (i)
                 
@@ -2234,18 +2119,33 @@ void remove_functionally_duplicate_tables() {
                 
                 // For S-TSID documents, keep the one with higher efdtVersion
                 if (g_lls_tables[i].type == TABLE_TYPE_STSID) {
+                    printf("DEBUG DEDUP STSID: Comparing i=%d (%s:%s) with j=%d (%s:%s)\n",
+                        i, g_lls_tables[i].destinationIp, g_lls_tables[i].destinationPort,
+                        j, g_lls_tables[j].destinationIp, g_lls_tables[j].destinationPort);
+                    printf("DEBUG DEDUP STSID: Comparing versions\n");
                     char* ver1 = strstr(g_lls_tables[i].content_id, "afdt:efdtVersion=\"");
                     char* ver2 = strstr(g_lls_tables[j].content_id, "afdt:efdtVersion=\"");
+                    
+                    printf("DEBUG DEDUP STSID: ver1=%p, ver2=%p\n", (void*)ver1, (void*)ver2);
                     
                     if (ver1 && ver2) {
                         int version1 = atoi(ver1 + 18);
                         int version2 = atoi(ver2 + 18);
                         
+                        printf("DEBUG DEDUP STSID: version1=%d, version2=%d\n", version1, version2);
+                        
                         if (version1 > version2) {
                             remove_index = j;
+                            printf("DEBUG DEDUP STSID: Keeping i (version %d), removing j (version %d)\n", 
+                                version1, version2);
+                        } else {
+                            printf("DEBUG DEDUP STSID: Keeping j (version %d), removing i (version %d)\n", 
+                                version2, version1);
                         }
                     }
                 }
+                
+                printf("DEBUG DEDUP: Removing index %d\n", remove_index);
                 
                 // For metadataEnvelope, try to keep the one with higher version
                 if (g_lls_tables[i].type == TABLE_TYPE_SERVICE_SIGNALING) {
@@ -2299,6 +2199,9 @@ void remove_functionally_duplicate_tables() {
         }
     }
     g_lls_table_count = write_idx;
+    
+    printf("Deduplication complete: removed %d duplicates, %d tables remaining\n", 
+           removed_count, g_lls_table_count);
 }
 
 /**
@@ -2310,6 +2213,30 @@ void process_route_payload(const u_char* payload, int len, const char* destIp, c
 
     uint32_t tsi = ntohl(*(uint32_t*)(payload + 8));
     uint32_t toi = ntohl(*(uint32_t*)(payload + 12));
+    
+    if (strcmp(destIp, "239.255.57.1") == 0 && strcmp(destPort, "8571") == 0 && toi == 459246) {
+        static int packet_count_459246 = 0;
+        packet_count_459246++;
+        if (packet_count_459246 <= 5) {  // Only log first 5 packets
+            printf("DEBUG WCVW TOI 459246: Packet %d, len=%d, TSI=%u\n", packet_count_459246, len, tsi);
+            printf("  Close object flag: %d, Close session flag: %d\n", 
+                   (payload[1] & 0x01), (payload[1] & 0x02) >> 1);
+        }
+    }
+    
+    int is_debug_toi = (strcmp(destIp, "239.255.0.255") == 0 && 
+                        strcmp(destPort, "8000") == 0 && 
+                        toi == 196810);
+    
+    if (is_debug_toi) {
+        g_route_packet_count_196810++;
+        printf("\n=== ROUTE PACKET #%d for TOI=%u ===\n", g_route_packet_count_196810, toi);
+        printf("Packet length: %d bytes\n", len);
+        printf("TSI: %u, TOI: %u\n", tsi, toi);
+        printf("LCT header bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n", 
+               payload[0], payload[1], payload[2], payload[3],
+               payload[4], payload[5], payload[6], payload[7]);
+    }
 
     const char* description = get_stream_description(destIp, destPort, tsi);
     record_data_usage(destIp, destPort, tsi, len, description);
@@ -2334,6 +2261,10 @@ void process_route_payload(const u_char* payload, int len, const char* destIp, c
     if (len > header_len + 4) {
         byte_offset = ntohl(*(uint32_t*)(payload + header_len));
         
+        if (is_esg_service(destIp, destPort) && toi >= 5290 && toi <= 5300) {
+            printf("DEBUG FEC: Read byte offset %u (0x%08x) from position %d\n", 
+                byte_offset, byte_offset, header_len);
+        }
     }
 
     // Reassembly logic - find or create buffer
@@ -2361,6 +2292,9 @@ void process_route_payload(const u_char* payload, int len, const char* destIp, c
         current_buf->next = g_reassembly_head;
         g_reassembly_head = current_buf;
         
+        if (is_debug_toi) {
+            printf("CREATED NEW BUFFER for TOI=%u\n", toi);
+        }
     }
 
     const u_char* data_to_copy = payload + payload_offset;
@@ -2389,18 +2323,71 @@ void process_route_payload(const u_char* payload, int len, const char* destIp, c
     // Write data at the specified byte offset
     memcpy(current_buf->buffer + byte_offset, data_to_copy, len_to_copy);
     
+    // Add detailed logging for ESG reassembly
+    if (is_esg_service(destIp, destPort) && toi >= 5290 && toi <= 5300) {
+        printf("DEBUG REASSEMBLY DETAIL: TOI=%u, wrote %d bytes at offset %u, buffer now %zu bytes\n",
+               toi, len_to_copy, byte_offset, current_buf->size);
+        printf("  Close flags: object=%d session=%d\n", close_object_flag, close_session_flag);
+        printf("  First 8 bytes at write position: ");
+        for (int i = 0; i < 8 && i < len_to_copy; i++) {
+            printf("%02x ", data_to_copy[i]);
+        }
+        printf("\n");
+        printf("  Buffer start (first 16 bytes): ");
+        for (int i = 0; i < 16 && i < current_buf->size; i++) {
+            printf("%02x ", current_buf->buffer[i]);
+        }
+        printf("\n");
+    }
+    
+    if (is_debug_toi) {
+        printf("WROTE %d bytes at byte offset %u. Buffer size now: %zu\n", 
+               len_to_copy, byte_offset, current_buf->size);
+        
+        // Show what the data looks like at this offset
+        printf("Data at offset (first 50 bytes): ");
+        for (int i = 0; i < 50 && i < len_to_copy; i++) {
+            char c = data_to_copy[i];
+            printf("%c", (c >= 32 && c < 127) ? c : '.');
+        }
+        printf("\n");
+    }
 
     if (close_object_flag || close_session_flag) {
+        if (is_debug_toi) {
+            printf("CLOSE FLAG SET - Processing complete object (%zu bytes)\n", current_buf->size);
+        }
         
-        // NEW: Debug the reassembled buffer
+        if (strcmp(destIp, "239.255.57.1") == 0 && strcmp(destPort, "8571") == 0) {
+            printf("DEBUG WCVW: Processing complete object for WCVW service\n");
+            printf("            TOI=%u, TSI=%u, Size=%zu bytes\n", toi, tsi, current_buf->size);
+            printf("            First 200 bytes: ");
+            for (int i = 0; i < 200 && i < current_buf->size; i++) {
+                char c = current_buf->buffer[i];
+                printf("%c", (c >= 32 && c < 127) ? c : '.');
+            }
+            printf("\n");
+        }
+        
         if (is_esg_service(destIp, destPort)) {
+            printf("DEBUG ESG REASSEMBLY: TOI=%u complete, size=%zu\n", toi, current_buf->size);
+            printf("First 16 bytes: ");
+            for (int i = 0; i < 16 && i < current_buf->size; i++) {
+                printf("%02x ", current_buf->buffer[i]);
+            }
+            printf("\n");
             
             // Check for GZIP signature
             if (current_buf->size >= 2) {
                 if (current_buf->buffer[0] == 0x1f && current_buf->buffer[1] == 0x8b) {
+                    printf("DEBUG ESG REASSEMBLY: Valid GZIP header found at start\n");
                 } else {
+                    // Search for GZIP header in first 100 bytes
+                    int found_gzip = 0;
                     for (size_t i = 0; i < 100 && i < current_buf->size - 1; i++) {
                         if (current_buf->buffer[i] == 0x1f && current_buf->buffer[i+1] == 0x8b) {
+                            printf("DEBUG ESG REASSEMBLY: GZIP header found at offset %zu (NOT at start!)\n", i);
+                            found_gzip = 1;
                             
                             // Create new buffer starting from GZIP header
                             size_t new_size = current_buf->size - i;
@@ -2410,11 +2397,15 @@ void process_route_payload(const u_char* payload, int len, const char* destIp, c
                                 free(current_buf->buffer);
                                 current_buf->buffer = new_buffer;
                                 current_buf->size = new_size;
+                                printf("DEBUG ESG REASSEMBLY: Trimmed buffer to start at GZIP header, new size=%zu\n", new_size);
                             }
                             break;
                         }
                     }
                     
+                    if (!found_gzip) {
+                        printf("DEBUG ESG REASSEMBLY: WARNING - No GZIP header found in reassembled object!\n");
+                    }
                 }
             }
         }
@@ -2449,6 +2440,9 @@ void process_route_payload(const u_char* payload, int len, const char* destIp, c
  */
 int is_gzip_complete(const uint8_t* buffer, size_t size) {
     if (size < 10) {
+        #if DEBUG_MMT
+        fprintf(stderr, "GZIP: Too small (%zu bytes)\n", size);
+        #endif
         return 0;
     }
     
@@ -2459,15 +2453,36 @@ int is_gzip_complete(const uint8_t* buffer, size_t size) {
     for (size_t i = 0; i <= size - 10; i++) {
         if (memcmp(buffer + i, gzip_magic, 2) == 0) {
             gzip_start = buffer + i;
+            #if DEBUG_MMT
+            fprintf(stderr, "GZIP: Found header at offset %zu\n", i);
+            #endif
             break;
         }
     }
     
     if (!gzip_start) {
+        #if DEBUG_MMT
+        fprintf(stderr, "GZIP: No header found in %zu bytes\n", size);
+        #endif
         return 0;
     }
     
     size_t gzip_size = size - (gzip_start - buffer);
+    
+    #if DEBUG_MMT
+    fprintf(stderr, "GZIP: Checking %zu bytes starting at offset %ld\n", 
+            gzip_size, gzip_start - buffer);
+    fprintf(stderr, "GZIP: First 16 bytes: ");
+    for (int i = 0; i < 16 && i < gzip_size; i++) {
+        fprintf(stderr, "%02x ", gzip_start[i]);
+    }
+    fprintf(stderr, "\n");
+    fprintf(stderr, "GZIP: Last 16 bytes: ");
+    for (int i = gzip_size - 16; i < gzip_size && i >= 0; i++) {
+        fprintf(stderr, "%02x ", gzip_start[i]);
+    }
+    fprintf(stderr, "\n");
+    #endif
     
     // Try to decompress to check completeness
     z_stream strm;
@@ -2478,6 +2493,9 @@ int is_gzip_complete(const uint8_t* buffer, size_t size) {
     strm.next_in = (Bytef *)gzip_start;
     
     if (inflateInit2(&strm, 16 + MAX_WBITS) != Z_OK) {
+        #if DEBUG_MMT
+        fprintf(stderr, "GZIP: inflateInit2 failed\n");
+        #endif
         return 0;
     }
     
@@ -2489,14 +2507,29 @@ int is_gzip_complete(const uint8_t* buffer, size_t size) {
     size_t bytes_produced = sizeof(temp_buf) - strm.avail_out;
     size_t bytes_consumed = gzip_size - strm.avail_in;
     
+    #if DEBUG_MMT
+    fprintf(stderr, "GZIP: inflate returned %d, consumed %zu/%zu bytes, produced %zu bytes\n", 
+            ret, bytes_consumed, gzip_size, bytes_produced);
+    #endif
+    
     int complete = 0;
     if (ret == Z_STREAM_END) {
         complete = 1;
+        #if DEBUG_MMT
+        fprintf(stderr, "GZIP: Stream complete!\n");
+        #endif
     } else if (ret == Z_OK && bytes_produced > 0) {
         // Partial success - check if we're close to complete
         if (bytes_consumed == gzip_size && gzip_size > 200) {
             complete = 1;  // Consumed all input and produced output
+            #if DEBUG_MMT
+            fprintf(stderr, "GZIP: Assuming complete (consumed all input)\n");
+            #endif
         }
+    } else {
+        #if DEBUG_MMT
+        fprintf(stderr, "GZIP: inflate failed or no progress\n");
+        #endif
     }
     
     inflateEnd(&strm);
@@ -2504,6 +2537,9 @@ int is_gzip_complete(const uint8_t* buffer, size_t size) {
     // Fallback: if we have a lot of data and it starts with valid GZIP, assume complete
     if (!complete && gzip_size > 500) {
         complete = 1;
+        #if DEBUG_MMT
+        fprintf(stderr, "GZIP: Force complete due to size (%zu bytes)\n", gzip_size);
+        #endif
     }
     
     return complete;
@@ -2544,257 +2580,29 @@ int is_xml_complete(const char* buffer, size_t size) {
     return (open_count > 0 && open_count == close_count);
 }
 
-
-
-/**
- * @brief Simplified binary MP table parser with two-pass approach
- */
-BinaryMptData* parse_binary_mp_table_multiformat(const uint8_t* buffer, size_t size) {
-    if (size < 20) return NULL;
-    
-    BinaryMptData* mpt_data = calloc(1, sizeof(BinaryMptData));
-    if (!mpt_data) return NULL;
-
-    BinaryMptAsset* current_asset_tail = NULL;
-    int assets_found = 0;
-    
-    // SIMPLIFIED approach: scan for all FE patterns first, then process each one
-    typedef struct {
-        const uint8_t* pos;
-        size_t offset;
-    } FePattern;
-    
-    FePattern fe_patterns[10];  // Up to 10 FE patterns
-    int fe_count = 0;
-    
-    // First pass: find all FE 01 patterns
-    for (size_t i = 0; i < size - 2 && fe_count < 10; i++) {
-        if (buffer[i] == 0xFE && buffer[i+1] == 0x01) {
-            fe_patterns[fe_count].pos = buffer + i;
-            fe_patterns[fe_count].offset = i;
-            fe_count++;
-        }
-    }
-    
-    // Second pass: process each FE pattern
-    for (int i = 0; i < fe_count; i++) {
-        const uint8_t* pos = fe_patterns[i].pos;
-        
-        if (pos + 20 >= buffer + size) {
-            continue;
-        }
-        
-        // Extract packet ID
-        uint16_t packet_id = 0;
-        if (pos[2] == 0x00 && pos[3] != 0x00) {
-            packet_id = (pos[3] << 8) | pos[4];
-        } else if (pos[2] == 0x00 && pos[3] == 0x00) {
-            packet_id = pos[4] | (pos[5] << 8);
-        }
-        
-        if (packet_id == 0 || packet_id >= 8192) {
-            continue;
-        }
-        
-        // Find the name by looking for next FE pattern or end of buffer
-        const uint8_t* name_start = pos + 16;
-        const uint8_t* name_end = buffer + size;  // Default to end of buffer
-        
-        if (i + 1 < fe_count) {
-            name_end = fe_patterns[i + 1].pos;  // Next FE pattern
-        }
-        
-        size_t name_len = name_end - name_start;
-        
-        // For the last pattern, the name might be very short or missing
-        if (name_len == 0 && i == fe_count - 1) {
-            
-            // Create a generic asset for the last pattern
-            BinaryMptAsset* asset = calloc(1, sizeof(BinaryMptAsset));
-            if (asset) {
-                snprintf(asset->assetId, sizeof(asset->assetId), "Asset_%u", packet_id);
-                strcpy(asset->assetType, "unknown");
-                asset->packetId = packet_id;
-                
-                // Add to linked list
-                if (mpt_data->head_asset == NULL) {
-                    mpt_data->head_asset = asset;
-                    current_asset_tail = asset;
-                } else {
-                    current_asset_tail->next = asset;
-                    current_asset_tail = asset;
-                }
-                
-                assets_found++;
-            }
-            continue;
-        }
-        
-        if (name_len > 0 && name_len < 50) {
-            // Validate name contains printable characters
-            int valid = 1;
-            for (size_t j = 0; j < name_len; j++) {
-                if (!isprint(name_start[j]) && name_start[j] != '-' && name_start[j] != '_') {
-                    valid = 0;
-                    break;
-                }
-            }
-            
-            if (valid) {
-                
-                // Create asset
-                BinaryMptAsset* asset = calloc(1, sizeof(BinaryMptAsset));
-                if (asset) {
-                    memcpy(asset->assetId, name_start, name_len);
-                    asset->assetId[name_len] = '\0';
-                    asset->packetId = packet_id;
-                    
-                    // Determine type from asset name
-                    if (strstr(asset->assetId, "video") || strstr(asset->assetId, "Video") || 
-                        strstr(asset->assetId, "hev1") || strstr(asset->assetId, "hvc1")) {
-                        strcpy(asset->assetType, "video");
-                    } else if (strstr(asset->assetId, "audio") || strstr(asset->assetId, "Audio") || 
-                               strstr(asset->assetId, "ac-4") || strstr(asset->assetId, "mp4a")) {
-                        strcpy(asset->assetType, "audio");
-                    } else if (strstr(asset->assetId, "cc") || strstr(asset->assetId, "stpp") || 
-                               strstr(asset->assetId, "Data") || strstr(asset->assetId, "imsc")) {
-                        strcpy(asset->assetType, "caption");
-                    } else {
-                        strcpy(asset->assetType, "unknown");
-                    }
-                    
-                    // Add to linked list
-                    if (mpt_data->head_asset == NULL) {
-                        mpt_data->head_asset = asset;
-                        current_asset_tail = asset;
-                    } else {
-                        current_asset_tail->next = asset;
-                        current_asset_tail = asset;
-                    }
-                    
-                    assets_found++;
-                }
-            }
-        }
-    }
-    
-    if (assets_found == 0) {
-        free(mpt_data);
-        return NULL;
-    }
-    
-    return mpt_data;
-}
-
-// Enhanced completion detection for MMT signaling
-int is_mmt_signaling_complete(const uint8_t* buffer, size_t size) {
-    if (size < 10) return 0;
-    
-    // Check for GZIP header
-    const uint8_t gzip_magic[] = {0x1f, 0x8b};
-    if (size > 2 && memcmp(buffer, gzip_magic, 2) == 0) {
-        return is_gzip_complete(buffer, size);
-    }
-    
-    // Check for uncompressed binary MP table
-    // Look for FE 01 00 pattern (various formats)
-    for (size_t i = 0; i < size - 10; i++) {
-        if (buffer[i] == 0xFE && buffer[i+1] == 0x01) {
-            // Found potential MP table start - assume complete if we have reasonable size
-            if (size > 100) return 1;
-        }
-    }
-    
-    // Check for XML patterns
-    if (memmem(buffer, size, "<?xml", 5)) {
-        return is_xml_complete((char*)buffer, size);
-    }
-    
-    // For small buffers, require more data
-    if (size < 50) return 0;
-    
-    // Default: assume complete if we have a reasonable amount of data
-    return (size > 200);
-}
-
-/**
- * @brief Fixed MMT signaling processor with deduplication
- */
-void process_mmt_signaling_payload(const uint8_t* buffer, size_t size, const char* destIp, const char* destPort) {
-    #if DEBUG_MMT
-    char filename[256];
-    snprintf(filename, sizeof(filename), "mmt_signaling_object_%d.bin", g_dump_count++);
-    FILE* f_dump = fopen(filename, "wb");
-    if (f_dump) {
-        fwrite(buffer, 1, size, f_dump);
-        fclose(f_dump);
-    }
-    #endif
-
-    const uint8_t* payload_to_process = buffer;
-    size_t size_to_process = size;
-    char* decompressed_buffer = NULL;
-
-    // Check for GZIP compression
-    const uint8_t gzip_magic[] = {0x1f, 0x8b}; 
-    if (size > 2 && memcmp(buffer, gzip_magic, 2) == 0) {
-        int decompressed_size = 0;
-        int consumed_size = 0;
-        decompressed_buffer = decompress_gzip(buffer, size, &decompressed_size, &consumed_size);
-        if(decompressed_buffer) {
-            payload_to_process = (uint8_t*)decompressed_buffer;
-            size_to_process = decompressed_size;
-            
-        } 
-    }
-
-    // Check if the payload is XML
-    const char* xml_marker = "<?xml";
-    const uint8_t* xml_start = NULL;
-    
-    // Search for XML marker (might not be at the beginning)
-    for (int offset = 0; offset < size_to_process && offset < 100; offset++) {
-        if (size_to_process - offset > 5 && 
-            memcmp(payload_to_process + offset, xml_marker, 5) == 0) {
-            xml_start = payload_to_process + offset;
-            break;
-        }
-    }
-
-    if (xml_start) {
-        size_t xml_len = size_to_process - (xml_start - payload_to_process);
-        
-        
-        char source_id[512];
-        snprintf(source_id, sizeof(source_id), "MMT Signaling (XML) on %s:%s", destIp, destPort);
-
-        TableType type = TABLE_TYPE_UNKNOWN;
-        void* parsed_data = NULL;
-        if (parse_xml((const char*)xml_start, xml_len, &type, &parsed_data, source_id) == 0) {
-            if (parsed_data) {
-                store_unique_table((const char*)xml_start, xml_len, type, parsed_data, destIp, destPort);
-            }
-        }
-    } 
-
-    if(decompressed_buffer) {
-        free(decompressed_buffer);
-    }
-}
-
 /**
  * @brief Enhanced terminal payload processor with better ESG handling
  */
 void process_terminal_payload(uint32_t toi, const uint8_t* buffer, size_t size, const char* destIp, const char* destPort, int is_mmt, uint16_t packet_id) {
     if (is_esg_service(destIp, destPort) && toi > 0) {
+        printf("DEBUG ESG TERMINAL: Processing TOI=%u payload, size=%zu\n", toi, size);
         
         // Check if it looks like XML
         if(size > 5 && memcmp(buffer, "<?xml", 5) == 0) {
+            printf("DEBUG ESG: Found XML content in TOI=%u\n", toi);
         } else if(size > 2 && buffer[0] == 0x1f && buffer[1] == 0x8b) {
+            printf("DEBUG ESG: Found GZIP content in TOI=%u\n", toi);
         } else {
+            printf("DEBUG ESG: Unknown content type in TOI=%u (first bytes: %02x %02x %02x %02x)\n", 
+                   toi, 
+                   size > 0 ? buffer[0] : 0x00,
+                   size > 1 ? buffer[1] : 0x00, 
+                   size > 2 ? buffer[2] : 0x00, 
+                   size > 3 ? buffer[3] : 0x00);
             
             // For non-GZIP, non-XML data that's too small or looks corrupted, skip it
             if (size < 100 || (size > 0 && buffer[0] > 0x7F && buffer[0] != 0x1f)) {
+                printf("DEBUG ESG: Skipping likely corrupted or incomplete fragment\n");
                 return;
             }
         }
@@ -2814,12 +2622,14 @@ void process_terminal_payload(uint32_t toi, const uint8_t* buffer, size_t size, 
 
     const uint8_t gzip_magic[] = {0x1f, 0x8b};
     if (size > 2 && memcmp(buffer, gzip_magic, 2) == 0) {
+        printf("--> Found GZIP stream in TOI=%u. Decompressing...\n", toi);
         int decompressed_size = 0, consumed_size = 0;
         char* decompressed_xml = decompress_gzip(buffer, size, &decompressed_size, &consumed_size);
         
         if (decompressed_xml && decompressed_size > 0) {
             // For ESG, find and skip garbage before XML
             if (is_esg_service(destIp, destPort)) {
+                printf("DEBUG ESG: Searching for XML declaration in %d bytes\n", decompressed_size);
                 
                 // Manually search for "<?xml" pattern (don't use strstr - it stops at null bytes)
                 const char* xml_pattern = "<?xml";
@@ -2845,6 +2655,8 @@ void process_terminal_payload(uint32_t toi, const uint8_t* buffer, size_t size, 
                 
                 if (xml_start && xml_start != decompressed_xml) {
                     size_t garbage_bytes = xml_start - decompressed_xml;
+                    printf("DEBUG ESG: Found XML at offset %zu, removing %zu bytes of garbage\n", 
+                        (size_t)(xml_start - decompressed_xml), garbage_bytes);
                     
                     // Create clean buffer
                     size_t clean_size = decompressed_size - garbage_bytes;
@@ -2858,9 +2670,19 @@ void process_terminal_payload(uint32_t toi, const uint8_t* buffer, size_t size, 
                         decompressed_xml = clean_xml;
                         decompressed_size = clean_size;
                         
+                        printf("DEBUG ESG: Cleaned buffer, new size=%zu\n", clean_size);
+                        printf("DEBUG ESG: First 100 clean chars: %.100s\n", decompressed_xml);
                     }
+                } else if (xml_start) {
+                    printf("DEBUG ESG: XML starts at beginning, no garbage to remove\n");
+                } else {
+                    printf("DEBUG ESG: ERROR - No XML found in decompressed data!\n");
                 }
             
+                // Show first 500 characters of decompressed content
+                int show_len = (decompressed_size > 500) ? 500 : decompressed_size;
+                printf("DEBUG ESG CONTENT: %.*s%s\n", show_len, decompressed_xml, 
+                    (decompressed_size > 500) ? "..." : "");
                 
                 // CRITICAL FIX: Check if there are multiple XML documents
                 int xml_count = 0;
@@ -2873,8 +2695,11 @@ void process_terminal_payload(uint32_t toi, const uint8_t* buffer, size_t size, 
                     search_pos = found + 5;
                 }
                 
+                printf("DEBUG ESG: Found %d XML declarations in decompressed data\n", xml_count);
+                
                 if (xml_count > 1) {
                     // Multiple documents - use the multi-document parser
+                    printf("DEBUG ESG: Processing as multi-document XML\n");
                     process_multi_document_xml(decompressed_xml, decompressed_size, destIp, destPort, source_id);
                 } else {
                     // Single document - parse normally
@@ -2882,8 +2707,26 @@ void process_terminal_payload(uint32_t toi, const uint8_t* buffer, size_t size, 
                     void* parsed_data = NULL;
                     
                     if (parse_xml(decompressed_xml, decompressed_size, &type, &parsed_data, source_id) == 0 && parsed_data) {
+                        printf("DEBUG ESG STORE: Parsed XML type=%d, is_esg_service=%d\n", type, is_esg_service(destIp, destPort));
+                        if (type == TABLE_TYPE_ESG_FRAGMENT) {
+                            printf("DEBUG ESG STORE: Storing ESG fragment for %s:%s\n", destIp, destPort);
+                        }
                         store_unique_table(decompressed_xml, decompressed_size, type, parsed_data, destIp, destPort);
                         
+                        printf("DEBUG ESG SUCCESS: Successfully parsed TOI=%u as XML type %d\n", toi, type);
+                    } else {
+                        printf("DEBUG ESG PARSE FAIL: Failed to parse decompressed content from TOI=%u\n", toi);
+                        
+                        // Try to identify why parsing failed
+                        if (decompressed_size < 10) {
+                            printf("DEBUG ESG: Content too short (%d bytes)\n", decompressed_size);
+                        } else if (memmem(decompressed_xml, decompressed_size, "<?xml", 5) == NULL) {
+                            printf("DEBUG ESG: No XML declaration found\n");
+                        } else if (memmem(decompressed_xml, decompressed_size, "<", 1) == NULL) {
+                            printf("DEBUG ESG: No XML tags found\n");
+                        } else {
+                            printf("DEBUG ESG: XML structure issue - check saved file\n");
+                        }
                     }
                 }
             } else {
@@ -2899,6 +2742,7 @@ void process_terminal_payload(uint32_t toi, const uint8_t* buffer, size_t size, 
             free(decompressed_xml);
         } else {
             if (is_esg_service(destIp, destPort)) {
+                printf("DEBUG ESG GZIP FAIL: Failed to decompress TOI=%u, consumed=%d bytes\n", toi, consumed_size);
                 
                 // Dump raw GZIP data for analysis
                 char gzip_filename[256];
@@ -2907,11 +2751,55 @@ void process_terminal_payload(uint32_t toi, const uint8_t* buffer, size_t size, 
                 if (f_gzip) {
                     fwrite(buffer, 1, size, f_gzip);
                     fclose(f_gzip);
+                    printf("DEBUG ESG: Saved raw GZIP data to %s for analysis\n", gzip_filename);
                 }
             }
         }
     } else if (size > 20) {
+        printf("--> Processing as plain text/XML in TOI=%u, size %zu\n", toi, size);
+
+        int looks_incomplete = 0;
+        if (size > 7) {
+            // Check if it starts with a closing tag
+            if (memcmp(buffer, "</", 2) == 0) {
+                printf("--> WARNING: XML fragment starts with closing tag, likely incomplete\n");
+                looks_incomplete = 1;
+            }
+            // Check if there's an opening tag without a matching closing tag
+            const char* opening_tags[] = {"<EFDT", "<FDT-Instance", "<S-TSID", "<MPD", NULL};
+            for (int i = 0; opening_tags[i]; i++) {
+                if (memmem(buffer, size > 100 ? 100 : size, opening_tags[i], strlen(opening_tags[i]))) {
+                    // Found opening tag, look for closing tag
+                    char closing_tag[64];
+                    if (strcmp(opening_tags[i], "<FDT-Instance") == 0) {
+                        strcpy(closing_tag, "</FDT-Instance>");
+                    } else {
+                        // Strip the '<' and add '</' and '>'
+                        snprintf(closing_tag, sizeof(closing_tag), "</%s>", opening_tags[i] + 1);
+                    }
+                    
+                    if (!memmem(buffer, size, closing_tag, strlen(closing_tag))) {
+                        printf("--> WARNING: Found %s but no matching closing tag, likely incomplete\n", opening_tags[i]);
+                        looks_incomplete = 1;
+                    }
+                    break;
+                }
+            }
+        }
         
+        if (looks_incomplete) {
+            printf("--> Skipping incomplete XML fragment\n");
+            return;  // Don't try to parse incomplete fragments
+        }
+        
+        if (is_esg_service(destIp, destPort)) {
+            printf("DEBUG ESG PLAIN: Processing plain content from TOI=%u\n", toi);
+            
+            // Show first 200 chars
+            int show_len = (size > 200) ? 200 : size;
+            printf("DEBUG ESG PLAIN CONTENT: %.*s%s\n", show_len, (char*)buffer, 
+                   (size > 200) ? "..." : "");
+        }
         
         TableType type = TABLE_TYPE_UNKNOWN;
         void* parsed_data = NULL;
@@ -2919,6 +2807,15 @@ void process_terminal_payload(uint32_t toi, const uint8_t* buffer, size_t size, 
             if(parsed_data) {
                 store_unique_table((const char*)buffer, size, type, parsed_data, destIp, destPort);
                 
+                if (is_esg_service(destIp, destPort)) {
+                    printf("DEBUG ESG SUCCESS: Successfully parsed plain TOI=%u as XML type %d\n", toi, type);
+                }
+            }
+        } else {
+            printf("--> XML parsing failed for object in TOI=%u.\n", toi);
+            
+            if (is_esg_service(destIp, destPort)) {
+                printf("DEBUG ESG PLAIN FAIL: Failed to parse plain content from TOI=%u\n", toi);
             }
         }
     }
@@ -2928,11 +2825,20 @@ void process_terminal_payload(uint32_t toi, const uint8_t* buffer, size_t size, 
  * @brief Parses a reassembled MIME object.
  */
 void process_mime_object(uint32_t toi, const uint8_t* buffer, size_t size, const char* boundary_str, const char* destIp, const char* destPort) {
+    if (is_esg_service(destIp, destPort)) {
+        printf("DEBUG ESG MIME: Processing multipart ESG with boundary: %s\n", boundary_str);
+    }
     size_t boundary_len = strlen(boundary_str);
     
     // Validate we have a complete MIME structure
     char final_boundary[300];
     snprintf(final_boundary, sizeof(final_boundary), "%s--", boundary_str);
+    
+    const uint8_t* final_marker = memmem(buffer, size, final_boundary, strlen(final_boundary));
+    if (!final_marker) {
+        printf("WARN: MIME object missing final boundary marker, may be incomplete\n");
+        // Continue anyway but be cautious
+    }
     
     const uint8_t* current_pos = buffer;
     size_t remaining_size = size;
@@ -2963,6 +2869,7 @@ void process_mime_object(uint32_t toi, const uint8_t* buffer, size_t size, const
         // Find the next boundary
         const uint8_t* next_boundary_loc = memmem(headers_start, size - (headers_start - buffer), boundary_str, boundary_len);
         if(!next_boundary_loc) {
+            printf("DEBUG MIME: No more boundaries found after part %d\n", part_count + 1);
             break;
         }
 
@@ -3004,6 +2911,7 @@ void process_mime_object(uint32_t toi, const uint8_t* buffer, size_t size, const
                 }
                 
                 if (!looks_valid) {
+                    printf("WARN MIME: Part %d doesn't look like valid XML, skipping\n", part_count);
                     current_pos = next_boundary_loc;
                     remaining_size = size - (current_pos - buffer);
                     continue;
@@ -3011,12 +2919,19 @@ void process_mime_object(uint32_t toi, const uint8_t* buffer, size_t size, const
                 
                 process_terminal_payload(toi, payload_start, payload_len, destIp, destPort, 0, 0);
             }
-        } 
+        } else {
+            printf("WARNING MIME: Could not find header separator for part %d\n", part_count + 1);
+        }
 
         current_pos = next_boundary_loc;
         remaining_size = size - (current_pos - buffer);
     }
     
+    if (part_count >= max_parts) {
+        printf("WARN: Hit maximum part limit (%d), stopping MIME processing\n", max_parts);
+    }
+    
+    printf("DEBUG MIME: Processed %d valid parts total\n", part_count);
 }
 
 /**
@@ -3094,6 +3009,7 @@ void process_and_store_route_object(uint32_t toi, const uint8_t* buffer, size_t 
         iteration++;
         
         const char* fdt_marker = "<FDT-Instance";
+        const char* efdt_marker = "<EFDT";
         const char* stsid_marker = "<S-TSID";
         const char* mpd_marker = "<MPD";
         const char* held_marker = "<HELD";
@@ -3101,6 +3017,7 @@ void process_and_store_route_object(uint32_t toi, const uint8_t* buffer, size_t 
         const char* meta_marker = "<metadataEnvelope";       // ADD THIS
 
         const uint8_t* fdt_start = memmem(scan_pos, remaining_size, fdt_marker, strlen(fdt_marker));
+        const uint8_t* efdt_start = memmem(scan_pos, remaining_size, efdt_marker, strlen(efdt_marker));
         const uint8_t* stsid_start = memmem(scan_pos, remaining_size, stsid_marker, strlen(stsid_marker));
         const uint8_t* mpd_start = memmem(scan_pos, remaining_size, mpd_marker, strlen(mpd_marker));
         const uint8_t* held_start = memmem(scan_pos, remaining_size, held_marker, strlen(held_marker));
@@ -3111,6 +3028,9 @@ void process_and_store_route_object(uint32_t toi, const uint8_t* buffer, size_t 
         int next_obj_type = -1;
         
         if (fdt_start) { next_obj_start = fdt_start; next_obj_type = 1; }
+        if (efdt_start && (!next_obj_start || efdt_start < next_obj_start)) {
+            next_obj_start = efdt_start; next_obj_type = 8;
+        }
         if (stsid_start && (!next_obj_start || stsid_start < next_obj_start)) { 
             next_obj_start = stsid_start; next_obj_type = 2;
         }
@@ -3146,11 +3066,30 @@ void process_and_store_route_object(uint32_t toi, const uint8_t* buffer, size_t 
                 is_mime_artifact = 1;
             }
             
-            if (is_mime_artifact) {
+            int is_xml_declaration = 0;
+            if (gap_len > 5 && memcmp(scan_pos, "<?xml", 5) == 0) {
+                const uint8_t* decl_end = memmem(scan_pos, gap_len, "?>", 2);
+                if (decl_end) {
+                    decl_end += 2;
+                    while (decl_end < scan_pos + gap_len && 
+                           (*decl_end == '\r' || *decl_end == '\n' || *decl_end == ' ' || *decl_end == '\t')) {
+                        decl_end++;
+                    }
+                    if (decl_end >= scan_pos + gap_len) {
+                        is_xml_declaration = 1;
+                    }
+                }
+            }
+            
+            if (is_mime_artifact || is_xml_declaration) {
+                // Skip this gap, don't process it
             } else if (gap_len > 20) {
                 process_terminal_payload(toi, scan_pos, gap_len, destIp, destPort, 0, 0);
             }
         }
+        
+        scan_pos = next_obj_start;
+        remaining_size = size - (scan_pos - buffer);
         
         scan_pos = next_obj_start;
         remaining_size = size - (scan_pos - buffer);
@@ -3160,15 +3099,17 @@ void process_and_store_route_object(uint32_t toi, const uint8_t* buffer, size_t 
         
         if (next_obj_type == 1) { 
             end_marker = "</FDT-Instance>";
+        } else if (next_obj_type == 8) {
+            end_marker = "</EFDT>";
         } else if (next_obj_type == 2) { 
             end_marker = "</S-TSID>";
         } else if (next_obj_type == 3) { 
             end_marker = "</MPD>";
         } else if (next_obj_type == 4) { 
             end_marker = "</HELD>";
-        } else if (next_obj_type == 5) {                    // ADD THIS
+        } else if (next_obj_type == 5) {
             end_marker = "</BundleDescriptionROUTE>";
-        } else if (next_obj_type == 6) {                    // ADD THIS
+        } else if (next_obj_type == 6) {
             end_marker = "</metadataEnvelope>";
         }
         
@@ -3353,6 +3294,9 @@ void store_slt_destinations(SltData* slt_data) {
                 strncpy(g_service_dests[g_service_dest_count].protocol, service->slsProtocol, sizeof(g_service_dests[0].protocol) - 1);
                 g_service_dests[g_service_dest_count].protocol[sizeof(g_service_dests[0].protocol) - 1] = '\0';
                 g_service_dests[g_service_dest_count].mmtSignalingPacketId = atoi(service->slsMmtpPacketId);
+                printf("DEBUG: Configured MMT service %s:%s with signaling PacketID=%u\n",
+                       service->slsDestinationIpAddress, service->slsDestinationUdpPort,
+                       g_service_dests[g_service_dest_count].mmtSignalingPacketId);
                 
                 strncpy(g_service_dests[g_service_dest_count].serviceCategory, service->serviceCategory, sizeof(g_service_dests[0].serviceCategory) - 1);
                 g_service_dests[g_service_dest_count].serviceCategory[sizeof(g_service_dests[0].serviceCategory) - 1] = '\0';
@@ -3391,6 +3335,10 @@ void store_unique_table(const char* content, int len, TableType type, void* pars
         }
     }
     
+    if (type == TABLE_TYPE_ESG_FRAGMENT) {
+        printf("DEBUG ESG STORE TABLE: Storing ESG type=%d, destIp='%s', destPort='%s', parsed_data=%p\n",
+               type, destIp ? destIp : "NULL", destPort ? destPort : "NULL", parsed_data);
+    }
     
     if (g_lls_table_count >= MAX_TABLES) {
         fprintf(stderr, "Warning: Maximum number of unique tables reached.\n");
@@ -3437,6 +3385,9 @@ void store_unique_table(const char* content, int len, TableType type, void* pars
     }
 
     g_lls_table_count++;
+    if (type == TABLE_TYPE_SLT) {
+        printf("Stored new SLT table (total count: %d)\n", g_lls_table_count);
+    }
 }
 
 void process_multi_document_xml(const char* xml_data, size_t size, const char* destIp, const char* destPort, const char* source_id) {
@@ -3484,18 +3435,32 @@ void process_multi_document_xml(const char* xml_data, size_t size, const char* d
 int parse_xml(const char* xml_content, int len, TableType* type, void** parsed_data_out, const char* source_identifier) {
     *parsed_data_out = NULL;
     *type = TABLE_TYPE_UNKNOWN;
+    
+    printf("DEBUG: parse_xml called with len=%d, source=%s\n", len, source_identifier);
+    printf("DEBUG: First 100 chars: %.100s\n", xml_content);
 
     xmlDocPtr doc = xmlReadMemory(xml_content, len, "noname.xml", NULL, XML_PARSE_RECOVER | XML_PARSE_NOWARNING | XML_PARSE_NOERROR);
 
+    if (doc == NULL) {
+        printf("XML document could not be parsed (from %s).\n", source_identifier);
+        return -1; // True failure
+    }
+    
+    printf("DEBUG: XML doc created successfully at %p\n", doc);
+
     xmlNodePtr root = xmlDocGetRootElement(doc);
     if (root == NULL) {
+        printf("XML document is empty or malformed (from %s).\n", source_identifier);
         xmlFreeDoc(doc);
         return -1; // True failure
     }
     
+    printf("DEBUG: Found XML root element: '%s' from %s\n", root->name, source_identifier);
+    
     if (xmlStrcmp(root->name, (const xmlChar *)"SLT") == 0) {
         *type = TABLE_TYPE_SLT;
         *parsed_data_out = parse_slt(doc);
+        printf("DEBUG: SLT parsing returned %p\n", *parsed_data_out);
     } else if (xmlStrcmp(root->name, (const xmlChar *)"SystemTime") == 0) {
         *type = TABLE_TYPE_SYSTEM_TIME;
         *parsed_data_out = parse_system_time(doc);
@@ -3503,14 +3468,27 @@ int parse_xml(const char* xml_content, int len, TableType* type, void** parsed_d
         *type = TABLE_TYPE_UCT;
         *parsed_data_out = parse_uct(doc);
     } else if (xmlStrcmp(root->name, (const xmlChar *)"CertificationData") == 0) {
+        printf("DEBUG: Detected CertificationData (CDT) XML document\n");
         *type = TABLE_TYPE_CDT;
         *parsed_data_out = parse_cdt(doc);
+        if (*parsed_data_out) {
+            printf("DEBUG: CDT parsing successful\n");
+        } else {
+            printf("DEBUG: CDT parsing failed\n");
+        }
     } else if (xmlStrcmp(root->name, (const xmlChar *)"UDST") == 0) {
         *type = TABLE_TYPE_UDST;
         *parsed_data_out = parse_udst(doc);
     } else if (xmlStrcmp(root->name, (const xmlChar *)"FDT-Instance") == 0) {
         *type = TABLE_TYPE_FDT;
         *parsed_data_out = parse_fdt(doc);
+        
+    } else if (xmlStrcmp(root->name, (const xmlChar *)"EFDT") == 0) {
+        *type = TABLE_TYPE_EFDT;
+        *parsed_data_out = parse_fdt_from_node(root); // Reuse FDT parser
+    } else if (xmlStrcmp(root->name, (const xmlChar *)"EFDT-Instance") == 0) {
+        *type = TABLE_TYPE_EFDT;
+        *parsed_data_out = parse_fdt_from_node(root);
     } else if (xmlStrcmp(root->name, (const xmlChar *)"S-TSID") == 0) {
         *type = TABLE_TYPE_STSID;
         *parsed_data_out = parse_stsid(doc);
@@ -3523,6 +3501,7 @@ int parse_xml(const char* xml_content, int len, TableType* type, void** parsed_d
     } else if (xmlStrcmp(root->name, (const xmlChar *)"Service") == 0) {
         *type = TABLE_TYPE_ESG_FRAGMENT;
         *parsed_data_out = parse_esg_service_fragment(doc);
+        printf("DEBUG ESG PARSE: parse_esg_service_fragment returned %p\n", *parsed_data_out);
     } else if (xmlStrcmp(root->name, (const xmlChar *)"Program") == 0) {
         *type = TABLE_TYPE_ESG_FRAGMENT;
         *parsed_data_out = parse_esg_service_fragment(doc);
@@ -3579,7 +3558,9 @@ int parse_xml(const char* xml_content, int len, TableType* type, void** parsed_d
         printf("--> INFO: Encountered unrecognized XML root element: '%s'\n", root->name);
     }
 
+    printf("DEBUG: About to free XML doc\n");
     xmlFreeDoc(doc);
+    printf("DEBUG: XML doc freed successfully\n");
     return 0; // Success
 }
 
@@ -3637,6 +3618,7 @@ FDTInstanceData* parse_fdt_from_node(xmlNodePtr fdt_node) {
     }
     
     if (file_count > 0) {
+        printf("--> FDT parsed with %d files.\n", file_count);
     } else {
         free(fdt_data);
         fdt_data = NULL;
@@ -3651,6 +3633,7 @@ FDTInstanceData* parse_fdt_from_node(xmlNodePtr fdt_node) {
  */
 FDTInstanceData* parse_fdt(xmlDocPtr doc) {
     xmlNodePtr root = xmlDocGetRootElement(doc);
+    if (!root) return NULL;
     if (xmlStrcmp(root->name, (const xmlChar *)"FDT-Instance") == 0) {
         return parse_fdt_from_node(root);
     }
@@ -3689,6 +3672,10 @@ MpdData* parse_mpd(xmlDocPtr doc) {
     if (!mpd_data) return NULL;
 
     xmlNodePtr root = xmlDocGetRootElement(doc);
+    if (!root) {
+        free(mpd_data);
+        return NULL;
+    }
     xmlChar* prop;
     
     prop = xmlGetProp(root, (const xmlChar *)"publishTime");
@@ -4119,6 +4106,10 @@ HeldData* parse_held(xmlDocPtr doc) {
     if (!held_data) return NULL;
 
     xmlNodePtr root = xmlDocGetRootElement(doc);
+    if (!root) {
+        free(held_data);
+        return NULL;
+    }
     xmlNodePtr cur_node = root->children;
 
     while(cur_node != NULL) {
@@ -4148,6 +4139,10 @@ SltData* parse_slt(xmlDocPtr doc) {
     if (!slt_data) return NULL;
 
     xmlNodePtr root = xmlDocGetRootElement(doc);
+    if (!root) {
+        free(slt_data);
+        return NULL;
+    }
     
     xmlChar* prop = xmlGetProp(root, (const xmlChar *)"bsid");
     if(prop) { strncpy(slt_data->bsid, (char*)prop, sizeof(slt_data->bsid)-1); xmlFree(prop); }
@@ -4291,6 +4286,10 @@ UctData* parse_uct(xmlDocPtr doc) {
     if (!uct_data) return NULL;
     
     xmlNodePtr root = xmlDocGetRootElement(doc);
+    if (!root) {
+        free(uct_data);
+        return NULL;
+    }
     xmlNodePtr ndp_node = root->children;
     NdPackage* current_package_tail = NULL;
 
@@ -4359,6 +4358,10 @@ UdstData* parse_udst(xmlDocPtr doc) {
     if (!udst_data) return NULL;
     
     xmlNodePtr root = xmlDocGetRootElement(doc);
+    if (!root) {
+        free(udst_data);
+        return NULL;
+    }
     xmlChar* prop = xmlGetProp(root, (const xmlChar*)"version");
     if(prop) { strncpy(udst_data->version, (char*)prop, sizeof(udst_data->version)-1); xmlFree(prop); }
 
@@ -4427,6 +4430,10 @@ UserServiceDescriptionData* parse_user_service_description(xmlDocPtr doc) {
     if (!usd_data) return NULL;
 
     xmlNodePtr root = xmlDocGetRootElement(doc);
+    if (!root) {
+        free(usd_data);
+        return NULL;
+    }
     xmlNodePtr cur_node = root->children;
     UsdEntry* current_entry_tail = NULL;
     xmlChar* prop;
@@ -4486,6 +4493,10 @@ UsdbData* parse_usbd(xmlDocPtr doc) {
     if (!usbd_data) return NULL;
 
     xmlNodePtr root = xmlDocGetRootElement(doc);
+    if (!root) {
+        free(usbd_data);
+        return NULL;
+    }
     xmlNodePtr cur_node = root->children;
     UsdEntryMmt* entry_tail = NULL;
 
@@ -4533,6 +4544,10 @@ UsdData* parse_usd(xmlDocPtr doc) {
     if (!usd_data) return NULL;
 
     xmlNodePtr root = xmlDocGetRootElement(doc);
+    if (!root) {
+        free(usd_data);
+        return NULL;
+    }
     xmlChar* prop;
     
     // Parse USD attributes
@@ -4601,285 +4616,6 @@ UsdData* parse_usd(xmlDocPtr doc) {
     return usd_data;
 }
 
-MptMessageData* parse_mpt_message(const uint8_t* buffer, size_t size, const char* destIp, const char* destPort) {
-    if (size < 10) return NULL;
-    
-    MptMessageData* mpt = calloc(1, sizeof(MptMessageData));
-    if (!mpt) return NULL;
-    
-    const uint8_t* pos = buffer;
-    size_t remaining = size;
-    
-    // Table ID (should be 0x20 for MPT)
-    mpt->table_id = *pos++;
-    remaining--;
-    
-    // Version
-    mpt->version = *pos++;
-    remaining--;
-    
-    // Length (2 bytes)
-    if (remaining < 2) goto error;
-    mpt->length = ntohs(*(uint16_t*)pos);
-    pos += 2;
-    remaining -= 2;
-    
-    // MMT Package ID length (1 byte)
-    if (remaining < 1) goto error;
-    mpt->mmt_package_id_length = *pos++;
-    remaining--;
-    
-    // MMT Package ID (variable length)
-    if (remaining < mpt->mmt_package_id_length) goto error;
-    if (mpt->mmt_package_id_length < sizeof(mpt->mmt_package_id)) {
-        memcpy(mpt->mmt_package_id, pos, mpt->mmt_package_id_length);
-        mpt->mmt_package_id[mpt->mmt_package_id_length] = '\0';
-    }
-    pos += mpt->mmt_package_id_length;
-    remaining -= mpt->mmt_package_id_length;
-    
-    // MPT mode (1 byte)
-    if (remaining < 1) goto error;
-    mpt->mpt_mode = *pos++;
-    remaining--;
-    
-    // MMT_general_location_info (skip for now if present)
-    if (mpt->mpt_mode == 0x01) {
-        if (remaining < 1) goto error;
-        uint8_t location_info_length = *pos++;
-        remaining--;
-        if (remaining < location_info_length) goto error;
-        pos += location_info_length;
-        remaining -= location_info_length;
-    }
-    
-    // MPU_timestamp_descriptor (1 byte)
-    if (remaining < 1) goto error;
-    mpt->mpu_timestamp_descriptor = *pos++;
-    remaining--;
-    
-    // Number of assets (1 byte)
-    if (remaining < 1) goto error;
-    mpt->num_of_assets = *pos++;
-    remaining--;
-    
-    // Parse each asset
-    MptAssetInfo* asset_tail = NULL;
-    for (int i = 0; i < mpt->num_of_assets; i++) {
-        if (remaining < 1) goto error;
-        
-        MptAssetInfo* asset = calloc(1, sizeof(MptAssetInfo));
-        if (!asset) goto error;
-        
-        // Asset ID length
-        asset->asset_id_length = *pos++;
-        remaining--;
-        
-        // Asset ID
-        if (remaining < asset->asset_id_length) {
-            free(asset);
-            goto error;
-        }
-        if (asset->asset_id_length < sizeof(asset->asset_id)) {
-            memcpy(asset->asset_id, pos, asset->asset_id_length);
-            asset->asset_id[asset->asset_id_length] = '\0';
-        }
-        pos += asset->asset_id_length;
-        remaining -= asset->asset_id_length;
-        
-        // Asset type length
-        if (remaining < 1) {
-            free(asset);
-            goto error;
-        }
-        asset->asset_type_length = *pos++;
-        remaining--;
-        
-        // Asset type
-        if (remaining < asset->asset_type_length) {
-            free(asset);
-            goto error;
-        }
-        if (asset->asset_type_length < sizeof(asset->asset_type)) {
-            memcpy(asset->asset_type, pos, asset->asset_type_length);
-            asset->asset_type[asset->asset_type_length] = '\0';
-        }
-        pos += asset->asset_type_length;
-        remaining -= asset->asset_type_length;
-        
-        // Asset clock relation flag + reserved
-        if (remaining < 1) {
-            free(asset);
-            goto error;
-        }
-        asset->asset_clock_relation_flag = (*pos >> 7) & 0x1;
-        pos++;
-        remaining--;
-        
-        // Location count
-        if (remaining < 1) {
-            free(asset);
-            goto error;
-        }
-        asset->location_count = *pos++;
-        remaining--;
-        
-        // Parse locations
-        MptAssetLocation* loc_tail = NULL;
-        for (int j = 0; j < asset->location_count; j++) {
-            if (remaining < 1) {
-                free(asset);
-                goto error;
-            }
-            
-            MptAssetLocation* loc = calloc(1, sizeof(MptAssetLocation));
-            if (!loc) {
-                free(asset);
-                goto error;
-            }
-            
-            // Location type
-            loc->location_type = *pos++;
-            remaining--;
-            
-            if (loc->location_type == 0x00) {
-                // Packet-based location
-                if (remaining < 2) {
-                    free(loc);
-                    free(asset);
-                    goto error;
-                }
-                loc->packet_id = ntohs(*(uint16_t*)pos);
-                pos += 2;
-                remaining -= 2;
-                
-            } else if (loc->location_type == 0x01) {
-                // URL-based location - skip for now
-                if (remaining < 1) {
-                    free(loc);
-                    free(asset);
-                    goto error;
-                }
-                uint8_t url_length = *pos++;
-                remaining--;
-                if (remaining < url_length) {
-                    free(loc);
-                    free(asset);
-                    goto error;
-                }
-                pos += url_length;
-                remaining -= url_length;
-            }
-            
-            // Add location to list
-            if (!asset->locations) {
-                asset->locations = loc;
-                loc_tail = loc;
-            } else {
-                loc_tail->next = loc;
-                loc_tail = loc;
-            }
-        }
-        
-        // Descriptor count for this asset
-        if (remaining < 1) {
-            free(asset);
-            goto error;
-        }
-        asset->descriptor_count = *pos++;
-        remaining--;
-        
-        // Parse asset descriptors (if any)
-        MptAssetDescriptor* desc_tail = NULL;
-        for (int j = 0; j < asset->descriptor_count; j++) {
-            if (remaining < 2) {
-                free(asset);
-                goto error;
-            }
-            
-            MptAssetDescriptor* desc = calloc(1, sizeof(MptAssetDescriptor));
-            if (!desc) {
-                free(asset);
-                goto error;
-            }
-            
-            desc->descriptor_tag = *pos++;
-            desc->descriptor_length = *pos++;
-            remaining -= 2;
-            
-            if (remaining < desc->descriptor_length) {
-                free(desc);
-                free(asset);
-                goto error;
-            }
-            
-            desc->descriptor_data = malloc(desc->descriptor_length);
-            if (desc->descriptor_data) {
-                memcpy(desc->descriptor_data, pos, desc->descriptor_length);
-            }
-            pos += desc->descriptor_length;
-            remaining -= desc->descriptor_length;
-            
-            // Add descriptor to list
-            if (!asset->descriptors) {
-                asset->descriptors = desc;
-                desc_tail = desc;
-            } else {
-                desc_tail->next = desc;
-                desc_tail = desc;
-            }
-        }
-        
-        // Add asset to MPT
-        if (!mpt->assets) {
-            mpt->assets = asset;
-            asset_tail = asset;
-        } else {
-            asset_tail->next = asset;
-            asset_tail = asset;
-        }
-    }
-    
-    return mpt;
-    
-error:
-    printf("ERROR: MPT parsing failed\n");
-    free_mpt_message_data(mpt);
-    return NULL;
-}
-
-// Free function
-void free_mpt_message_data(MptMessageData* mpt) {
-    if (!mpt) return;
-    
-    MptAssetInfo* asset = mpt->assets;
-    while (asset) {
-        MptAssetInfo* next_asset = asset->next;
-        
-        // Free locations
-        MptAssetLocation* loc = asset->locations;
-        while (loc) {
-            MptAssetLocation* next_loc = loc->next;
-            free(loc);
-            loc = next_loc;
-        }
-        
-        // Free descriptors
-        MptAssetDescriptor* desc = asset->descriptors;
-        while (desc) {
-            MptAssetDescriptor* next_desc = desc->next;
-            free(desc->descriptor_data);
-            free(desc);
-            desc = next_desc;
-        }
-        
-        free(asset);
-        asset = next_asset;
-    }
-    
-    free(mpt);
-}
-
 /**
  * @brief NEW: Parses a DWD (placeholder).
  */
@@ -4899,6 +4635,10 @@ ServiceSignalingData* parse_service_signaling(xmlDocPtr doc) {
     if (!signaling_data) return NULL;
 
     xmlNodePtr root = xmlDocGetRootElement(doc);
+    if (!root) {
+        free(signaling_data);
+        return NULL;
+    }
     xmlNodePtr cur_node = root->children;
     ServiceSignalingFragment* current_frag_tail = NULL;
     xmlChar* prop;
@@ -4937,6 +4677,10 @@ StsidData* parse_stsid(xmlDocPtr doc) {
     if (!stsid_data) return NULL;
 
     xmlNodePtr root = xmlDocGetRootElement(doc);
+    if (!root) {
+        free(stsid_data);
+        return NULL;
+    }
     xmlNodePtr rs_node = root->children;
     StsidLogicalStream* current_ls_tail = NULL;
     xmlChar* prop;
@@ -5039,54 +4783,6 @@ StsidData* parse_stsid(xmlDocPtr doc) {
 }
 
 /**
- * @brief Parses an MMT MP_Table XML document.
- */
-MpTableData* parse_mp_table(xmlDocPtr doc) {
-    MpTableData* mpt_data = calloc(1, sizeof(MpTableData));
-    if (!mpt_data) return NULL;
-
-    xmlNodePtr root = xmlDocGetRootElement(doc);
-    xmlChar* prop = xmlGetProp(root, (const xmlChar *)"MPTpackageID");
-    if(prop) { strncpy(mpt_data->mptPackageId, (char*)prop, sizeof(mpt_data->mptPackageId)-1); xmlFree(prop); }
-
-    xmlNodePtr asset_node = root->children;
-    MptAsset* current_asset_tail = NULL;
-    
-    while (asset_node != NULL) {
-        if (asset_node->type == XML_ELEMENT_NODE && xmlStrcmp(asset_node->name, (const xmlChar *)"Asset") == 0) {
-            MptAsset* asset = calloc(1, sizeof(MptAsset));
-            if(!asset) continue;
-
-            prop = xmlGetProp(asset_node, (const xmlChar*)"assetId");
-            if(prop) { strncpy(asset->assetId, (char*)prop, sizeof(asset->assetId)-1); xmlFree(prop); }
-            prop = xmlGetProp(asset_node, (const xmlChar*)"assetType");
-            if(prop) { strncpy(asset->assetType, (char*)prop, sizeof(asset->assetType)-1); xmlFree(prop); }
-            
-            // Find the packetId in the location info
-            xmlNodePtr location_node = asset_node->children;
-            while(location_node != NULL && (location_node->type != XML_ELEMENT_NODE || xmlStrcmp(location_node->name, (const xmlChar*)"MPT_Location_Info") != 0)) {
-                location_node = location_node->next;
-            }
-            if(location_node) {
-                prop = xmlGetProp(location_node, (const xmlChar*)"packetId");
-                if(prop) { strncpy(asset->packetId, (char*)prop, sizeof(asset->packetId)-1); xmlFree(prop); }
-            }
-
-            if(mpt_data->head_asset == NULL) {
-                mpt_data->head_asset = asset;
-                current_asset_tail = asset;
-            } else {
-                current_asset_tail->next = asset;
-                current_asset_tail = asset;
-            }
-        }
-        asset_node = asset_node->next;
-    }
-
-    return mpt_data;
-}
-
-/**
  * @brief Enhanced GZIP decompression with better error reporting
  */
 char* decompress_gzip(const uint8_t* compressed_data, int compressed_size, int* decompressed_size_out, int* consumed_size_out) {
@@ -5129,6 +4825,7 @@ char* decompress_gzip(const uint8_t* compressed_data, int compressed_size, int* 
         ret = inflate(&stream, Z_NO_FLUSH);
 
         if (ret == Z_STREAM_ERROR || ret == Z_MEM_ERROR) {
+            printf("DEBUG GZIP: inflate error %d\n", ret);
             free(output_buffer);
             inflateEnd(&stream);
             return NULL;
@@ -5137,6 +4834,7 @@ char* decompress_gzip(const uint8_t* compressed_data, int compressed_size, int* 
         // For Z_DATA_ERROR, if we got significant output, use it anyway
         if (ret == Z_DATA_ERROR) {
             if (stream.total_out > 100) {  // We got at least some useful data
+                printf("DEBUG GZIP: Z_DATA_ERROR but recovered %lu bytes\n", stream.total_out);
                 *decompressed_size_out = stream.total_out;
                 *consumed_size_out = compressed_size - stream.avail_in;
                 inflateEnd(&stream);
@@ -5145,6 +4843,7 @@ char* decompress_gzip(const uint8_t* compressed_data, int compressed_size, int* 
                 }
                 return output_buffer;
             }
+            printf("DEBUG GZIP: inflate error %d\n", ret);
             free(output_buffer);
             inflateEnd(&stream);
             return NULL;
@@ -5170,6 +4869,12 @@ char* decompress_gzip(const uint8_t* compressed_data, int compressed_size, int* 
     *decompressed_size_out = stream.total_out;
     *consumed_size_out = compressed_size - stream.avail_in;
 
+    if (ret == Z_STREAM_END) {
+        printf("DEBUG GZIP SUCCESS: Decompressed %lu bytes\n", stream.total_out);
+    } else {
+        printf("DEBUG GZIP: Incomplete decompression, ret=%d\n", ret);
+    }
+
     inflateEnd(&stream);
 
     // Null-terminate for safety when treating as string
@@ -5180,898 +4885,7 @@ char* decompress_gzip(const uint8_t* compressed_data, int compressed_size, int* 
     return output_buffer;
 }
 
-/**
- * @brief Enhanced MMT packet header parser based on libatsc3 logic
- */
-int parse_mmt_packet_header(const uint8_t* buffer, size_t length, mmt_packet_header_t* header) {
-    if (!buffer || !header || length < 4) {
-        return -1;
-    }
-    
-    memset(header, 0, sizeof(mmt_packet_header_t));
-    
-    const uint8_t* pos = buffer;
-    size_t remaining = length;
-    
-    // Parse fixed header (4 bytes minimum)
-    if (remaining < 4) return -1;
-    
-    header->version = (pos[0] >> 6) & 0x3;
-    header->packet_counter_flag = (pos[0] >> 5) & 0x1;
-    header->fec_type = (pos[0] >> 4) & 0x1;
-    header->extension_flag = (pos[0] >> 3) & 0x1;
-    header->rap_flag = (pos[0] >> 2) & 0x1;
-    // bits 1-0 are reserved
-    
-    header->packet_id = ntohs(*(uint16_t*)(pos + 2));
-    
-    pos += 4;
-    remaining -= 4;
-    
-    // Parse timestamp (4 bytes)
-    if (remaining < 4) return -1;
-    header->timestamp = ntohl(*(uint32_t*)pos);
-    pos += 4;
-    remaining -= 4;
-    
-    // Parse packet sequence number (4 bytes)
-    if (remaining < 4) return -1;
-    header->packet_sequence_number = ntohl(*(uint32_t*)pos);
-    pos += 4;
-    remaining -= 4;
-    
-    // Parse packet counter if present
-    if (header->packet_counter_flag) {
-        if (remaining < 2) return -1;
-        header->packet_counter = ntohs(*(uint16_t*)pos);
-        pos += 2;
-        remaining -= 2;
-    }
-    
-    // Parse header extension if present
-    if (header->extension_flag) {
-        if (remaining < 4) return -1;
-        header->extension_type = ntohs(*(uint16_t*)pos);
-        header->extension_length = ntohs(*(uint16_t*)(pos + 2));
-        pos += 4;
-        remaining -= 4;
-        
-        if (remaining < header->extension_length) return -1;
-        if (header->extension_length > 0) {
-            header->extension_data = malloc(header->extension_length);
-            if (header->extension_data) {
-                memcpy(header->extension_data, pos, header->extension_length);
-            }
-        }
-        pos += header->extension_length;
-        remaining -= header->extension_length;
-    }
-    
-    // Calculate payload offset and length
-    header->payload_length = remaining;
-    
-    
-    return pos - buffer; // Return header length
-}
 
-/**
- * @brief Parse MMT signaling message
- */
-int parse_mmt_signaling_message(const uint8_t* buffer, size_t length, mmt_signaling_message_t* message) {
-    if (!buffer || !message || length < 7) {
-        return -1;
-    }
-    
-    memset(message, 0, sizeof(mmt_signaling_message_t));
-    
-    const uint8_t* pos = buffer;
-    
-    // Parse message header
-    message->message_id = ntohs(*(uint16_t*)pos);
-    pos += 2;
-    
-    message->version = *pos++;
-    
-    message->length = ntohl(*(uint32_t*)pos) & 0xFFFFFF; // 24-bit length
-    pos += 3;
-    
-    if (length < 7 + message->length) {
-        return -1;
-    }
-    
-    // Copy payload
-    if (message->length > 0) {
-        message->payload = malloc(message->length);
-        if (message->payload) {
-            memcpy(message->payload, pos, message->length);
-        } else {
-            return -1;
-        }
-    }
-    
-    
-    return 7 + message->length;
-}
-
-/**
- * @brief Process MMT signaling message and extract useful information
- */
-void process_mmt_signaling_message(mmt_signaling_message_t* message, const char* destIp, const char* destPort) {
-    if (!message || !message->payload) return;
-    
-    switch (message->message_id) {
-        case MMT_SIGNALING_MPT_MESSAGE: 
-            MptMessageData* mpt_data = parse_mpt_message(message->payload, message->length, destIp, destPort);
-            if (mpt_data) {
-                // Store it
-                char content_id[256];
-                snprintf(content_id, sizeof(content_id), "MMT_MPT_Structured_%s:%s", destIp, destPort);
-                store_unique_table(content_id, strlen(content_id), TABLE_TYPE_MP_TABLE_BINARY, 
-                                 mpt_data, destIp, destPort);
-            }
-            break;
-        
-        case MMT_SIGNALING_PA_MESSAGE:
-            break;
-            
-        case MMT_SIGNALING_MPI_MESSAGE: {
-            break;
-        }
-            
-        default:
-            break;
-    }
-}
-
-ProprietaryMptData* parse_proprietary_mpt(const uint8_t* buffer, size_t size) {
-    if (size < 30) return NULL;
-    
-    const uint8_t* pos = buffer;
-    
-    
-    ProprietaryMptData* mpt = calloc(1, sizeof(ProprietaryMptData));
-    if (!mpt) return NULL;
-    
-    // MPT Message Header
-    mpt->table_id = *pos++;
-    mpt->version = *pos++;
-    mpt->length = ntohs(*(uint16_t*)pos);
-    pos += 2;
-    
-    if (mpt->table_id != 0x20) {
-        free(mpt);
-        return NULL;
-    }
-    
-    // Package-level descriptor
-    if (*pos == 0xfe) {
-        uint8_t desc_len = *pos++;
-        
-        if (desc_len < sizeof(mpt->package_descriptor)) {
-            memcpy(mpt->package_descriptor, pos, desc_len);
-            mpt->package_descriptor[desc_len] = '\0';
-        }
-        pos += desc_len;
-    }
-    
-    // Skip mystery bytes (00 00 04 00 00 00 00 01)
-    if (pos[0] == 0x00 && pos[1] == 0x00 && pos[2] == 0x04) {
-        pos += 8;
-    }
-    
-    // Parse assets
-    ProprietaryMptAsset* asset_tail = NULL;
-    int asset_count = 0;
-    
-    while (pos < buffer + size - 30) {
-        
-        // Asset starts with 00 00 00 XX where XX is length
-        if (pos[0] != 0x00 || pos[1] != 0x00 || pos[2] != 0x00) {
-            break;
-        }
-        
-        ProprietaryMptAsset* asset = calloc(1, sizeof(ProprietaryMptAsset));
-        if (!asset) break;
-        
-        // Asset ID length
-        pos += 3;
-        asset->asset_id_length = *pos++;
-        
-        if (asset->asset_id_length == 0 || asset->asset_id_length >= sizeof(asset->asset_id) || 
-            pos + asset->asset_id_length > buffer + size) {
-            free(asset);
-            break;
-        }
-        
-        // Asset ID string
-        memcpy(asset->asset_id, pos, asset->asset_id_length);
-        asset->asset_id[asset->asset_id_length] = '\0';
-        pos += asset->asset_id_length;
-        
-        // NEW: Parse asset type/codec field (4 bytes)
-        if (pos + 4 <= buffer + size) {
-            char type_field[5];
-            memcpy(type_field, pos, 4);
-            type_field[4] = '\0';
-            
-            // This is the codec identifier
-            strncpy(asset->codec, type_field, sizeof(asset->codec) - 1);
-            
-            // Determine asset type from codec
-            if (strcmp(type_field, "hvc1") == 0 || strcmp(type_field, "hev1") == 0) {
-                strcpy(asset->asset_type, "Video");
-            } else if (strncmp(type_field, "ac-4", 4) == 0) {
-                strcpy(asset->asset_type, "Audio");
-            } else if (strcmp(type_field, "stpp") == 0) {
-                strcpy(asset->asset_type, "Captions");
-            } else if (strcmp(type_field, "mp4a") == 0) {
-                strcpy(asset->asset_type, "Audio");
-            } else {
-                strcpy(asset->asset_type, "Unknown");
-            }
-            pos += 4;
-        } else {
-            free(asset);
-            break;
-        }
-        
-        // Next should be FE descriptor with packet ID
-        
-        if (*pos != 0xfe) {
-            free(asset);
-            break;
-        }
-        
-        pos++; // skip FE
-        uint8_t desc_len = *pos++;
-
-        // Skip the descriptor payload
-        if (pos + desc_len > buffer + size) {
-            printf("    ERROR: Descriptor extends beyond buffer\n");
-            free(asset);
-            break;
-        }
-        pos += desc_len;
-
-        // Packet ID comes AFTER the descriptor (2 bytes, big-endian)
-        if (pos + 2 > buffer + size) {
-            printf("    ERROR: Not enough bytes for packet ID\n");
-            free(asset);
-            break;
-        }
-
-        asset->packet_id = ntohs(*(uint16_t*)pos);
-        pos += 2;
-
-        // Check if there are more assets coming (look ahead for the 00 00 00 XX pattern)
-        if (pos + 7 <= buffer + size && pos + 7 + 4 <= buffer + size) {
-            // Check if next bytes look like another asset header
-            if (pos[7] == 0x00 && pos[8] == 0x00 && pos[9] == 0x00) {
-                pos += 7;
-            }
-        }
-
-        // ONLY add to list after all validation passed
-        if (!mpt->assets) {
-            mpt->assets = asset;
-            asset_tail = asset;
-        } else {
-            asset_tail->next = asset;
-            asset_tail = asset;
-        }
-        asset_count++;
-    }
-    
-    mpt->num_assets = asset_count;
-    
-    return mpt;
-}
-
-void free_proprietary_mpt_data(ProprietaryMptData* mpt) {
-    if (!mpt) {
-        return;
-    }
-    
-    ProprietaryMptAsset* asset = mpt->assets;
-    int freed_count = 0;
-    
-    while (asset) {
-        
-        // Check if the pointer looks valid (not obviously corrupted)
-        if ((uintptr_t)asset < 0x1000) {
-            break;
-        }
-        
-        ProprietaryMptAsset* next = asset->next;
-        
-        free(asset);
-        asset = next;
-        freed_count++;
-        
-        // Safety check - if we've freed more than expected, something is wrong
-        if (freed_count > 100) {
-            break;
-        }
-    }
-    free(mpt);
-}
-
-// Parse MPU header
-int parse_mpu_header(const uint8_t* buffer, size_t length, MpuHeader* header) {
-    if (!buffer || !header || length < 8) return -1;
-    
-    const uint8_t* pos = buffer;
-    
-    header->mpu_sequence_number = ntohl(*(uint32_t*)pos);
-    pos += 4;
-    
-    header->fragmentation_indicator = (pos[0] >> 6) & 0x3;
-    header->fragment_type = pos[0] & 0x7;
-    pos += 4;
-    
-    header->mfu_data = pos;
-    header->mfu_data_length = length - (pos - buffer);
-    
-    return pos - buffer;
-}
-
-// Extract HEVC parameters - NO FALLBACKS
-void extract_hevc_params(const uint8_t* data, size_t len, MmtMediaParams* params) {
-    // Start loop at i=4 to safely access data[i-4]
-    for (size_t i = 4; i < len - 32; i++) {
-        if ((data[i-3] == 0 && data[i-2] == 0 && data[i-1] == 1) ||
-            (data[i-4] == 0 && data[i-3] == 0 && data[i-2] == 0 && data[i-1] == 1)) {
-            
-            uint8_t nal_type = (data[i] >> 1) & 0x3F;
-            
-            if (nal_type == 33 && i + 20 < len) { // SPS
-                strcpy(params->video_codec, "HEVC");
-                
-                uint16_t width_hint = (data[i+7] << 8) | data[i+8];
-                
-                if (width_hint > 0x700 && width_hint < 0x800) {
-                    strcpy(params->resolution, "1920x1080");
-                    strcpy(params->scan_type, "progressive");
-                    strcpy(params->frame_rate, "59.94");
-                } else if (width_hint > 0x400 && width_hint < 0x600) {
-                    strcpy(params->resolution, "1280x720");
-                    strcpy(params->scan_type, "progressive");
-                    strcpy(params->frame_rate, "59.94");
-                }
-                return;
-            }
-        }
-    }
-}
-
-void extract_ac4_params(const uint8_t* data, size_t len, MmtMediaParams* params) {
-    // Need at least 12 bytes to safely check for 'dac4' and access config
-    if (len < 12) {
-        return;
-    }
-    
-    for (size_t i = 0; i < len - 12; i++) {
-        if (data[i] == 'd' && data[i+1] == 'a' && data[i+2] == 'c' && data[i+3] == '4') {
-            strcpy(params->audio_codec, "AC-4");
-            
-            // AC-4 specific stream structure at i+8 onwards
-            if (i + 12 < len) {
-                uint8_t presentation_config = data[i+10];
-                
-                if (presentation_config & 0x20) {
-                    strcpy(params->audio_channels, "7.1");
-                } else if (presentation_config & 0x10) {
-                    strcpy(params->audio_channels, "5.1");
-                } else if (presentation_config & 0x08) {
-                    strcpy(params->audio_channels, "2.0");
-                }
-            }
-            return;
-        }
-    }
-}
-
-void extract_mmt_media_params_from_mpu(const uint8_t* payload, size_t length, 
-                                        const char* asset_type, MmtMediaParams* params) {
-    
-    // Initialization fragments are typically much larger (100s to 1000s of bytes)
-    if (length < 100) {
-        return;
-    }
-    
-    MpuHeader mpu;
-    if (parse_mpu_header(payload, length, &mpu) < 0) {
-        return;
-    }
-    
-    if (mpu.fragment_type != 0) {
-        return;
-    }
-    
-    // Also check MFU data size
-    if (mpu.mfu_data_length < 50) {
-        return;
-    }
-    
-    if (strcmp(asset_type, "video") == 0 || strcmp(asset_type, "Video") == 0) {
-        extract_hevc_params(mpu.mfu_data, mpu.mfu_data_length, params);
-
-    } else if (strcmp(asset_type, "audio") == 0 || strcmp(asset_type, "Audio") == 0) {
-        extract_ac4_params(mpu.mfu_data, mpu.mfu_data_length, params);
-
-    }
-}
-
-// Cache management
-void cache_mmt_params(const char* dest_ip, const char* dest_port, 
-                      uint16_t packet_id, MmtMediaParams* params) {
-    for (int i = 0; i < g_mmt_params_cache_count; i++) {
-        if (strcmp(g_mmt_params_cache[i].destIp, dest_ip) == 0 &&
-            strcmp(g_mmt_params_cache[i].destPort, dest_port) == 0 &&
-            g_mmt_params_cache[i].packet_id == packet_id) {
-            g_mmt_params_cache[i].params = *params;
-            return;
-        }
-    }
-    
-    if (g_mmt_params_cache_count < 100) {
-        strcpy(g_mmt_params_cache[g_mmt_params_cache_count].destIp, dest_ip);
-        strcpy(g_mmt_params_cache[g_mmt_params_cache_count].destPort, dest_port);
-        g_mmt_params_cache[g_mmt_params_cache_count].packet_id = packet_id;
-        g_mmt_params_cache[g_mmt_params_cache_count].params = *params;
-        g_mmt_params_cache_count++;
-    }
-}
-
-MmtMediaParams* get_cached_mmt_params(const char* dest_ip, const char* dest_port, 
-                                      uint16_t packet_id) {
-    for (int i = 0; i < g_mmt_params_cache_count; i++) {
-        if (strcmp(g_mmt_params_cache[i].destIp, dest_ip) == 0 &&
-            strcmp(g_mmt_params_cache[i].destPort, dest_port) == 0 &&
-            g_mmt_params_cache[i].packet_id == packet_id) {
-            return &g_mmt_params_cache[i].params;
-        }
-    }
-    return NULL;
-}
-
-void process_enhanced_mmt_payload(const u_char* payload, int len, ServiceDestination* dest_info) {
-    if (len < 32) return;
-    
-    mmt_packet_header_t header;
-    int header_len = parse_mmt_packet_header(payload, len, &header);
-    
-    if (header_len < 0) {
-        return;
-    }
-    
-    // Record data usage (use packet ID as TSI equivalent for MMT)
-    const char* description = get_stream_description(dest_info->destinationIpStr, 
-                                                   dest_info->destinationPortStr, 
-                                                   header.packet_id);
-    record_data_usage(dest_info->destinationIpStr, dest_info->destinationPortStr, 
-                     header.packet_id, len, description);
-    
-    log_mmt_packet_id(header.packet_id);
-    
-    const uint8_t* payload_start = payload + header_len;
-    size_t payload_size = header.payload_length;
-    
-    // Process signaling packets
-    if (header.packet_id == 0 || header.packet_id == dest_info->mmtSignalingPacketId) {
-
-        
-        process_enhanced_mmt_signaling_payload(payload_start, payload_size, 
-                                             dest_info->destinationIpStr, dest_info->destinationPortStr);
-    } else {
-        // This is a media packet - extract parameters from initialization MPUs
-        const char* asset_type = get_media_type_from_mpt(dest_info->destinationIpStr, 
-                                                         dest_info->destinationPortStr, 
-                                                         header.packet_id);
-        
-        if (asset_type && (strcmp(asset_type, "video") == 0 || strcmp(asset_type, "audio") == 0 || 
-                          strcmp(asset_type, "Video") == 0 || strcmp(asset_type, "Audio") == 0)) {
-
-            
-            MmtMediaParams params = {0};
-            extract_mmt_media_params_from_mpu(payload_start, payload_size, asset_type, &params);
-            
-            if (strlen(params.resolution) > 0 || strlen(params.audio_codec) > 0) {
-
-                cache_mmt_params(dest_info->destinationIpStr, dest_info->destinationPortStr, 
-                               header.packet_id, &params);
-            } 
-        }
-    }
-    
-    free_mmt_packet_header(&header);
-}
-
-/**
- * @brief Enhanced MMT signaling processor that handles the actual payload formats found
- */
-void process_enhanced_mmt_signaling_payload(const uint8_t* buffer, size_t size, const char* destIp, const char* destPort) {
-    if (size < 20) return;
-    
-    // Look for GZIP magic bytes (1F 8B)
-    for (size_t i = 0; i < size - 10; i++) {
-        if (buffer[i] == 0x1F && buffer[i+1] == 0x8B) {
-            
-            const uint8_t* gzip_start = buffer + i;
-            size_t gzip_size = size - i;
-            
-            // Try to decompress
-            int decompressed_size = 0;
-            int consumed_size = 0;
-            char* decompressed = decompress_gzip(gzip_start, gzip_size, &decompressed_size, &consumed_size);
-            
-            if (decompressed && decompressed_size > 0) {
-                // Try to parse as XML
-                TableType type = TABLE_TYPE_UNKNOWN;
-                void* parsed_data = NULL;
-                char source_id[256];
-                snprintf(source_id, sizeof(source_id), "MMT GZIP from %s:%s", destIp, destPort);
-                
-                if (parse_xml(decompressed, decompressed_size, &type, &parsed_data, source_id) == 0 && parsed_data) {
-                    store_unique_table(decompressed, decompressed_size, type, parsed_data, destIp, destPort);
-                    
-                    // If this is a USBD, also extract and store USD tables with proper IP/port
-                    if (type == TABLE_TYPE_USBD) {
-                        
-                        xmlDocPtr doc = xmlReadMemory(decompressed, decompressed_size, "usbd.xml", NULL, XML_PARSE_RECOVER);
-                        if (doc) {
-                            xmlNodePtr root = xmlDocGetRootElement(doc);
-                            xmlNodePtr cur_node = root->children;
-                            
-                            while (cur_node != NULL) {
-                                if (cur_node->type == XML_ELEMENT_NODE && 
-                                    xmlStrcmp(cur_node->name, (const xmlChar *)"UserServiceDescription") == 0) {
-                                    
-                                    char* usd_xml = extract_node_as_xml(cur_node);
-                                    if (usd_xml) {
-                                        TableType usd_type = TABLE_TYPE_USD;
-                                        void* usd_parsed_data = NULL;
-                                        if (parse_xml(usd_xml, strlen(usd_xml), &usd_type, &usd_parsed_data, "Nested USD") == 0 && usd_parsed_data) {
-                                            store_unique_table(usd_xml, strlen(usd_xml), TABLE_TYPE_USD, usd_parsed_data, destIp, destPort);
-                                        }
-                                        free(usd_xml);
-                                    }
-                                }
-                                cur_node = cur_node->next;
-                            }
-                            xmlFreeDoc(doc);
-                        }
-                    }
-                }
-                
-                free(decompressed);
-                return;
-            }
-        }
-    }
-    
-    // Look for 0x20 (MPT table_id)
-    for (size_t i = 0; i < size - 30 && i < size; i++) {
-        if (buffer[i] == 0x20 && i > 0) {
-            // Check if preceded by proprietary wrapper (0x18) or is standalone
-            const uint8_t* mpt_buffer = (i >= 5 && buffer[i-5] == 0x18) ? buffer + i - 5 : buffer + i;
-            size_t mpt_size = size - (mpt_buffer - buffer);
-            
-            ProprietaryMptData* mpt_data = parse_proprietary_mpt(mpt_buffer, mpt_size);
-            if (mpt_data && mpt_data->num_assets > 0) {  // ADDED: && mpt_data->num_assets > 0
-                char content_id[256];
-                snprintf(content_id, sizeof(content_id), "MMT_MPT_Proprietary_%s:%s", destIp, destPort);
-                store_unique_table(content_id, strlen(content_id), TABLE_TYPE_MP_TABLE_BINARY, 
-                                mpt_data, destIp, destPort);
-                return;
-            }
-            if (mpt_data) free_proprietary_mpt_data(mpt_data);  // Free even if 0 assets
-        }
-    }
-    
-    // Look for asset names (common in MP tables)
-    const char* asset_patterns[] = {"videoasset", "audioasset", "asset", "hev1", "hvc1", "mp4a", NULL};
-    for (int p = 0; asset_patterns[p]; p++) {
-        const char* pattern = asset_patterns[p];
-        size_t pattern_len = strlen(pattern);
-        
-        for (size_t i = 0; i < size - pattern_len; i++) {
-            if (memcmp(buffer + i, pattern, pattern_len) == 0) {
-                
-                // Try to parse the whole buffer as binary MP table
-                BinaryMptData* parsed_data = parse_enhanced_binary_mp_table(buffer, size);
-                if (parsed_data) {
-                    char content_id[256];
-                    snprintf(content_id, sizeof(content_id), "Asset_Pattern_MPT_%s:%s", destIp, destPort);
-                    store_unique_table(content_id, strlen(content_id), 
-                                    TABLE_TYPE_MP_TABLE_PATTERN_MATCHED,
-                                    parsed_data, destIp, destPort);
-                    return;
-                }
-                break; // Found pattern, no need to continue searching for this one
-            }
-        }
-    }
-    
-    // Check for other signaling message types
-    mmt_signaling_message_t message;
-    memset(&message, 0, sizeof(message));
-    int msg_len = parse_mmt_signaling_message(buffer, size, &message);
-    if (msg_len > 0 && message.payload) {
-        process_mmt_signaling_message(&message, destIp, destPort);
-        free(message.payload);
-        return;
-    }
-}
-
-/**
- * @brief Precise binary MP table parser with fallback for different formats
- */
-BinaryMptData* parse_enhanced_binary_mp_table(const uint8_t* buffer, size_t size) {
-    if (size < 20) return NULL;
-    
-    BinaryMptData* mpt_data = calloc(1, sizeof(BinaryMptData));
-    if (!mpt_data) return NULL;
-    
-    BinaryMptAsset* asset_tail = NULL;
-    int assets_found = 0;
-    
-    // Method 1: Look for FE markers (standard MMT format)
-    for (size_t i = 0; i < size - 20; i++) {
-        if (buffer[i] == 0xFE) {
-            
-            // Check if this looks like a valid asset entry
-            if (i + 10 < size) {
-                // Look for packet ID after FE marker (usually 2-3 bytes after)
-                uint16_t packet_id = 0;
-                
-                // Try different offsets for packet ID
-                for (int pid_offset = 3; pid_offset <= 5 && i + pid_offset + 1 < size; pid_offset++) {
-                    uint16_t potential_pid = ntohs(*(uint16_t*)(buffer + i + pid_offset));
-                    if (potential_pid > 0 && potential_pid < 8192) {
-                        packet_id = potential_pid;
-                        break;
-                    }
-                }
-                
-                // Look backwards from FE marker for asset name
-                char asset_name[64] = "";
-                
-                // Search backwards up to 50 bytes for readable asset name
-                for (int back_offset = 1; back_offset <= 50 && back_offset <= i; back_offset++) {
-                    size_t check_pos = i - back_offset;
-                    
-                    // Look for start of readable string
-                    if (isalpha(buffer[check_pos]) || isdigit(buffer[check_pos])) {
-                        // Find the full string
-                        size_t str_start = check_pos;
-                        while (str_start > 0 && 
-                               (isalnum(buffer[str_start - 1]) || buffer[str_start - 1] == '_' || 
-                                buffer[str_start - 1] == '-' || isdigit(buffer[str_start - 1]))) {
-                            str_start--;
-                        }
-                        
-                        size_t str_end = check_pos;
-                        while (str_end < i && 
-                               (isalnum(buffer[str_end]) || buffer[str_end] == '_' || 
-                                buffer[str_end] == '-' || isdigit(buffer[str_end]))) {
-                            str_end++;
-                        }
-                        
-                        size_t str_len = str_end - str_start;
-                        if (str_len >= 4 && str_len < 64) {
-                            memcpy(asset_name, buffer + str_start, str_len);
-                            asset_name[str_len] = '\0';
-                            
-                            // Check if this looks like a real asset name
-                            if (strstr(asset_name, "Video") || strstr(asset_name, "Audio") || 
-                                strstr(asset_name, "Data") || strstr(asset_name, "asset") ||
-                                strstr(asset_name, "hev1") || strstr(asset_name, "hvc1") ||
-                                strstr(asset_name, "mp4a") || strstr(asset_name, "ac-4") ||
-                                strstr(asset_name, "stpp")) {
-                                break;
-                            }
-                        }
-                        asset_name[0] = '\0'; // Reset if not a good match
-                    }
-                }
-                
-                // Create asset if we found valid name and/or packet ID
-                if (strlen(asset_name) > 0 || packet_id > 0) {
-                    BinaryMptAsset* asset = calloc(1, sizeof(BinaryMptAsset));
-                    if (asset) {
-                        if (strlen(asset_name) > 0) {
-                            strcpy(asset->assetId, asset_name);
-                        } else {
-                            snprintf(asset->assetId, sizeof(asset->assetId), "Asset_PID_%u", packet_id);
-                        }
-                        
-                        asset->packetId = packet_id;
-                        
-                        // Determine asset type from name
-                        if (strstr(asset->assetId, "Video") || strstr(asset->assetId, "video") ||
-                            strstr(asset->assetId, "hev1") || strstr(asset->assetId, "hvc1")) {
-                            strcpy(asset->assetType, "video");
-                        } else if (strstr(asset->assetId, "Audio") || strstr(asset->assetId, "audio") ||
-                                   strstr(asset->assetId, "mp4a") || strstr(asset->assetId, "ac-4")) {
-                            strcpy(asset->assetType, "audio");
-                        } else if (strstr(asset->assetId, "Data") || strstr(asset->assetId, "stpp")) {
-                            strcpy(asset->assetType, "caption");
-                        } else {
-                            strcpy(asset->assetType, "unknown");
-                        }
-                        
-                        // Extract codec information from asset name
-                        if (strstr(asset->assetId, "hvc1") || strstr(asset->assetId, "hev1")) {
-                            strcpy(asset->codec, "HEVC");
-                        } else if (strstr(asset->assetId, "ac-4")) {
-                            strcpy(asset->codec, "AC-4");
-                        } else if (strstr(asset->assetId, "stpp")) {
-                            strcpy(asset->codec, "TTML");
-                        } else if (strstr(asset->assetId, "mp4a")) {
-                            strcpy(asset->codec, "AAC");
-                        } else {
-                            strcpy(asset->codec, "Unknown");
-                        }
-                        
-                        // Add to linked list
-                        if (mpt_data->head_asset == NULL) {
-                            mpt_data->head_asset = asset;
-                            asset_tail = asset;
-                        } else {
-                            asset_tail->next = asset;
-                            asset_tail = asset;
-                        }
-                        
-                        assets_found++;
-                        
-                        // Skip ahead past this FE marker to avoid duplicates
-                        i += 10;
-                    }
-                }
-            }
-        }
-    }
-    
-    // Method 2: Fallback - if no FE markers, look for clear asset name patterns
-    if (assets_found == 0) {
-        
-        // Look for specific asset patterns
-        const char* asset_patterns[] = {"videoasset", "audioasset", NULL};
-        
-        for (int p = 0; asset_patterns[p]; p++) {
-            const char* pattern = asset_patterns[p];
-            size_t pattern_len = strlen(pattern);
-            
-            for (size_t i = 0; i < size - pattern_len; i++) {
-                if (memcmp(buffer + i, pattern, pattern_len) == 0) {
-                    
-                    // Find the complete asset name
-                    size_t name_start = i;
-                    size_t name_end = i + pattern_len;
-                    
-                    // Extend the name to include numbers, codec info, etc.
-                    while (name_end < size && 
-                           (isalnum(buffer[name_end]) || buffer[name_end] == '_' || 
-                            buffer[name_end] == '-' || isdigit(buffer[name_end]))) {
-                        name_end++;
-                    }
-                    
-                    size_t name_len = name_end - name_start;
-                    if (name_len >= pattern_len && name_len < 64) {
-                        char asset_name[64];
-                        memcpy(asset_name, buffer + name_start, name_len);
-                        asset_name[name_len] = '\0';
-                        
-                        // Look for packet ID near this asset (within 20 bytes)
-                        uint16_t packet_id = 0;
-                        for (int offset = -10; offset <= 10; offset++) {
-                            size_t check_pos = i + offset;
-                            if (check_pos > 0 && check_pos + 1 < size) {
-                                uint16_t potential_pid = ntohs(*(uint16_t*)(buffer + check_pos));
-                                if (potential_pid > 0 && potential_pid < 8192) {
-                                    packet_id = potential_pid;
-                                    break;
-                                }
-                            }
-                        }
-                        
-                        BinaryMptAsset* asset = calloc(1, sizeof(BinaryMptAsset));
-                        if (asset) {
-                            strcpy(asset->assetId, asset_name);
-                            asset->packetId = packet_id;
-                            
-                            // Determine asset type
-                            if (strstr(asset_name, "video")) {
-                                strcpy(asset->assetType, "video");
-                            } else if (strstr(asset_name, "audio")) {
-                                strcpy(asset->assetType, "audio");
-                            } else {
-                                strcpy(asset->assetType, "unknown");
-                            }
-                            
-                            // Add to linked list
-                            if (mpt_data->head_asset == NULL) {
-                                mpt_data->head_asset = asset;
-                                asset_tail = asset;
-                            } else {
-                                asset_tail->next = asset;
-                                asset_tail = asset;
-                            }
-                            
-                            assets_found++;
-                            
-                            // Skip past this asset to avoid duplicates
-                            i = name_end - 1;
-                            break; // Break out of pattern loop for this position
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    if (assets_found == 0) {
-        free(mpt_data);
-        return NULL;
-    }
-    
-    return mpt_data;
-}
-
-/**
- * @brief Cleanup functions
- */
-void free_mmt_packet_header(mmt_packet_header_t* header) {
-    if (header && header->extension_data) {
-        free(header->extension_data);
-        header->extension_data = NULL;
-    }
-}
-
-/**
- * @brief Logs a seen MMT Packet ID and increments its count.
- */
-void log_mmt_packet_id(uint16_t packet_id) {
-    // Only log the first occurrence of each packet ID
-    if (!packet_id_seen[packet_id]) {
-        packet_id_seen[packet_id] = true;
-    }
-    
-    // Still maintain the count for statistics
-    for (int i = 0; i < g_packet_id_log_count; i++) {
-        if (g_packet_id_log[i].id == packet_id) {
-            g_packet_id_log[i].count++;
-            return;
-        }
-    }
-
-    if (g_packet_id_log_count < MAX_UNIQUE_PIDS) {
-        g_packet_id_log[g_packet_id_log_count].id = packet_id;
-        g_packet_id_log[g_packet_id_log_count].count = 1;
-        g_packet_id_log_count++;
-    }
-}
-
-/**
- * @brief Prints the summary of all unique MMT packet IDs and their counts.
- */
-void print_packet_id_log() {
-    printf("\n--- MMT Packet ID Summary ---\n");
-    if (g_packet_id_log_count == 0) {
-        printf("No MMT packets were found on the monitored streams.\n");
-        return;
-    }
-    printf("Found %d unique Packet IDs:\n", g_packet_id_log_count);
-    printf("----------------------------------\n");
-    printf("| Packet ID   |  Packet Count  |\n");
-    printf("----------------------------------\n");
-    for (int i = 0; i < g_packet_id_log_count; i++) {
-        printf("| %-11u | %-14d |\n", g_packet_id_log[i].id, g_packet_id_log[i].count);
-    }
-    printf("----------------------------------\n");
-    printf("Tip: The signaling packet ID (for the MP Table) usually has a very low count compared to media packets.\n\n");
-}
 
 // Comparison function for sorting data usage by bytes (descending)
 int compare_data_usage(const void *a, const void *b) {
@@ -6738,9 +5552,6 @@ int has_lmt_data(void) {
     return 0;
 }
 
-/**
- * @brief Generates the final HTML report from the stored LLS tables.
- */
 void generate_html_report(const char* filename) {
     FILE *f = fopen(filename, "w");
     if (f == NULL) {
@@ -6750,7 +5561,7 @@ void generate_html_report(const char* filename) {
 
     fprintf(f, "<!DOCTYPE html>\n<html lang='en'>\n<head>\n<meta charset='UTF-8'>\n");
     fprintf(f, "<meta name='viewport' content='width=device-width, initial-scale=1.0'>\n");
-    fprintf(f, "<title>RENDER - RabbitEars NextGen Data Evaluator Report - v0.1</title>\n");
+    fprintf(f, "<title>RENDER - RabbitEars NextGen Data Evaluator Report - v%s</title>\n", RENDER_VERSION);
     
     generate_keydata_section(f);
     
@@ -6781,7 +5592,7 @@ void generate_html_report(const char* filename) {
            "pre { background-color: #e9ecef; padding: 12px; margin: 0; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace; font-size: 13px; color: #333; max-height: 300px; overflow-y: auto; }\n"
            "details:not([open]) pre { display: none; }\n"
            "</style>\n</head>\n<body>\n<div class='container'>\n");
-    fprintf(f, "<h1>RENDER - RabbitEars NextGen Data Evaluator Report - v0.1</h1>\n");
+    fprintf(f, "<h1>RENDER - RabbitEars NextGen Data Evaluator Report - v%s</h1>\n", RENDER_VERSION);
     
     // --- L1 Information Section ---
     if (get_enhanced_l1_signaling_data()) {
@@ -6803,10 +5614,15 @@ void generate_html_report(const char* filename) {
             lmt_count++;
             LmtData* lmt_data = (LmtData*)g_lls_tables[i].parsed_data;
             
-            // Count total multicast entries
+            // Count total multicast entries and check if any service has duplicates
             int total_multicast_count = 0;
+            int has_any_duplicates = 0;
+            
             LmtService* count_service = lmt_data->services;
             while (count_service) {
+                if (count_service->duplicate_count > 0) {
+                    has_any_duplicates = 1;
+                }
                 LmtMulticast* count_multicast = count_service->multicasts;
                 while (count_multicast) {
                     total_multicast_count++;
@@ -6815,14 +5631,40 @@ void generate_html_report(const char* filename) {
                 count_service = count_service->next;
             }
 
-            fprintf(f, "<details><summary>Link Mapping Table (LMT) Version %d - %d Services</summary>\n", 
+            fprintf(f, "<details><summary>Link Mapping Table (LMT) Version %d - %d Service(s)", 
                     lmt_data->lmt_version, total_multicast_count);
+            
+            if (lmt_data->duplicate_count > 0) {
+                fprintf(f, " - <span style='color: #ff6600;'>⚠ %d duplicate%s detected and removed</span>", 
+                        lmt_data->duplicate_count,
+                        lmt_data->duplicate_count == 1 ? "" : "s");
+            }
+            
+            fprintf(f, "</summary>\n");
             fprintf(f, "<div class='details-content'>\n");
-            fprintf(f, "<table><thead><tr><th>PLP ID</th><th>Source IP:Port</th><th>Destination IP:Port</th><th>Service ID</th><th>Service Name</th><th>Flags</th></tr></thead><tbody>\n");
+            
+            // Conditional header based on whether duplicates exist
+            fprintf(f, "<table><thead><tr><th>PLP ID</th><th>Source IP:Port</th><th>Destination IP:Port</th><th>Service ID</th><th>Service Name</th><th>Flags</th>");
+            if (has_any_duplicates) {
+                fprintf(f, "<th>Duplicates Removed</th>");
+            }
+            fprintf(f, "</tr></thead><tbody>\n");
             
             LmtService* service = lmt_data->services;
             while (service) {
                 LmtMulticast* multicast = service->multicasts;
+                
+                // Track if we've already printed the duplicate count for this service
+                int first_row_for_service = 1;
+                int service_row_count = 0;
+                
+                // Count rows for this service first (for rowspan)
+                LmtMulticast* count_mc = service->multicasts;
+                while (count_mc) {
+                    service_row_count++;
+                    count_mc = count_mc->next;
+                }
+                
                 while (multicast) {
                     // Build flags string
                     char flags_str[32] = "";
@@ -6843,7 +5685,6 @@ void generate_html_report(const char* filename) {
                             SltData* slt_data = (SltData*)g_lls_tables[j].parsed_data;
                             ServiceInfo* slt_service = slt_data->head;
                             while (slt_service) {
-                                // Check if destination IP:port matches
                                 if (strcmp(slt_service->slsDestinationIpAddress, multicast->dest_ip_str) == 0 &&
                                     strcmp(slt_service->slsDestinationUdpPort, multicast->dest_port_str) == 0) {
                                     strncpy(service_id_str, slt_service->serviceId, sizeof(service_id_str) - 1);
@@ -6854,17 +5695,11 @@ void generate_html_report(const char* filename) {
                                 }
                                 slt_service = slt_service->next;
                             }
-                            if (strlen(service_id_str) > 0) break; // Found a match, stop searching
+                            if (strlen(service_id_str) > 0) break;
                         }
                     }
                     
-                    // If no match found, show placeholder
-                    /*if (strlen(service_id_str) == 0) {
-                        strcpy(service_id_str, "?");
-                        strcpy(service_name_str, "Unknown");
-                    }*/
-                    
-                    fprintf(f, "<tr><td>%d</td><td>%d.%d.%d.%d:%d</td><td>%s:%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n",
+                    fprintf(f, "<tr><td>%d</td><td>%d.%d.%d.%d:%d</td><td>%s:%s</td><td>%s</td><td>%s</td><td>%s</td>",
                         service->plp_id,
                         (multicast->src_ip >> 24) & 0xff, (multicast->src_ip >> 16) & 0xff,
                         (multicast->src_ip >> 8) & 0xff, multicast->src_ip & 0xff,
@@ -6872,6 +5707,24 @@ void generate_html_report(const char* filename) {
                         multicast->dest_ip_str, multicast->dest_port_str,
                         service_id_str, service_name_str,
                         flags_str);
+                    
+                    // Add duplicate count column if needed
+                    if (has_any_duplicates) {
+                        if (first_row_for_service && service->duplicate_count > 0) {
+                            // Use rowspan to show duplicate count across all rows for this service
+                            fprintf(f, "<td rowspan='%d' style='background-color: #fff3cd; text-align: center; vertical-align: middle;'><strong>%d</strong></td>",
+                                    service_row_count, service->duplicate_count);
+                        } else if (first_row_for_service) {
+                            // No duplicates for this service
+                            fprintf(f, "<td rowspan='%d' style='text-align: center; vertical-align: middle;'>-</td>",
+                                    service_row_count);
+                        }
+                        // else: subsequent rows for this service don't get a cell (covered by rowspan)
+                    }
+                    
+                    fprintf(f, "</tr>\n");
+                    
+                    first_row_for_service = 0;
                     multicast = multicast->next;
                 }
                 service = service->next;
@@ -7092,7 +5945,7 @@ void generate_html_report(const char* filename) {
         fprintf(f, "<div><strong>Source:</strong> %s<br />\n", service->slsSourceIpAddress);
         fprintf(f, "<strong>Destination:</strong> %s:%s</div>\n", service->slsDestinationIpAddress, service->slsDestinationUdpPort);
         
-        // Check for MPD data to show video/audio info (using highest resolution)
+        // Check for MPD data to show video/audio info (using highest resolution) for ROUTE
         MpdData* service_mpd = NULL;
         for (int j = 0; j < g_lls_table_count; j++) {
             if (strcmp(g_lls_tables[j].destinationIp, service->slsDestinationIpAddress) == 0 &&
@@ -7103,6 +5956,7 @@ void generate_html_report(const char* filename) {
             }
         }
         
+        // Display ROUTE stream parameters (from MPD)
         if (service_mpd) {
             // Find video and audio info (prefer highest resolution for video, most channels for audio)
             MpdAdaptationSet* as = service_mpd->head_as;
@@ -7193,56 +6047,9 @@ void generate_html_report(const char* filename) {
                 }
                 as = as->next;
             }
-        } else if (strcmp(service->slsProtocol, "2") == 0) {
-            // MMT service - look for cached parameters
-            int found_video = 0, found_audio = 0;
-            
-            // Find video and audio packet IDs from MPT
-            for (int j = 0; j < g_lls_table_count; j++) {
-                if (strcmp(g_lls_tables[j].destinationIp, service->slsDestinationIpAddress) == 0 &&
-                    strcmp(g_lls_tables[j].destinationPort, service->slsDestinationUdpPort) == 0 &&
-                    g_lls_tables[j].type == TABLE_TYPE_MP_TABLE_BINARY) {
-                    
-                    ProprietaryMptData* mpt_data = (ProprietaryMptData*)g_lls_tables[j].parsed_data;
-                    ProprietaryMptAsset* asset = mpt_data->assets;
-                    
-                    while (asset && (!found_video || !found_audio)) {
-                        if (strcmp(asset->asset_type, "video") == 0 && !found_video) {
-                            MmtMediaParams* params = get_cached_mmt_params(service->slsDestinationIpAddress,
-                                                                           service->slsDestinationUdpPort,
-                                                                           asset->packet_id);
-                            if (params && strlen(params->resolution) > 0) {
-                                fprintf(f, "<div><strong>Video:</strong> %s", params->resolution);
-                                if (strlen(params->scan_type) > 0) {
-                                    fprintf(f, "%c", (strcmp(params->scan_type, "progressive") == 0) ? 'p' : 'i');
-                                }
-                                if (strlen(params->frame_rate) > 0) {
-                                    fprintf(f, " (%.2f fps)", atof(params->frame_rate));
-                                }
-                                if (strlen(params->video_codec) > 0) {
-                                    fprintf(f, "<br />\n<strong>Codec:</strong> %s", params->video_codec);
-                                }
-                                fprintf(f, "</div>\n");
-                                found_video = 1;
-                            }
-                        } else if (strcmp(asset->asset_type, "audio") == 0 && !found_audio) {
-                            MmtMediaParams* params = get_cached_mmt_params(service->slsDestinationIpAddress,
-                                                                           service->slsDestinationUdpPort,
-                                                                           asset->packet_id);
-                            if (params && strlen(params->audio_codec) > 0) {
-                                fprintf(f, "<div><strong>Audio:</strong> ");
-                                if (strlen(params->audio_channels) > 0) {
-                                    fprintf(f, "%s ch ", params->audio_channels);
-                                }
-                                fprintf(f, "<br />\n<strong>Codec:</strong> %s</div>\n", params->audio_codec);
-                                found_audio = 1;
-                            }
-                        }
-                        asset = asset->next;
-                    }
-                    break;
-                }
-            }
+        } else {
+            int mmt_audio_streams = 0;
+            display_mmt_stream_parameters(f, service, &mmt_audio_streams);
         }
         
         fprintf(f, "<div><strong>Hidden:</strong> ");
@@ -7312,11 +6119,18 @@ void generate_html_report(const char* filename) {
         int usd_mmt_count = 0;
         int service_signaling_count = 0;
         int mp_table_xml_count = 0;
-        int mp_table_binary_count = 0;
         int held_count = 0;
         int esg_count = 0;
         int dwd_count = 0;
         
+        printf("DEBUG: Checking for ESG fragments for service %s at %s:%s\n", 
+            service->serviceId, service->slsDestinationIpAddress, service->slsDestinationUdpPort);
+        for (int debug_j = 0; debug_j < g_lls_table_count; debug_j++) {
+            if (g_lls_tables[debug_j].type == TABLE_TYPE_ESG_FRAGMENT) {
+                printf("  Found ESG fragment at table index %d: destIp='%s' destPort='%s'\n",
+                    debug_j, g_lls_tables[debug_j].destinationIp, g_lls_tables[debug_j].destinationPort);
+            }
+        }
 
         // Define the desired display order
         TableType display_order[] = {
@@ -7330,7 +6144,8 @@ void generate_html_report(const char* filename) {
             TABLE_TYPE_MPD,                    // 1. MPD (most important for media info)
             TABLE_TYPE_HELD,                          // 8. HELD
             TABLE_TYPE_ESG_FRAGMENT,                  // 9. ESG
-            TABLE_TYPE_DWD                            // 10. DWD
+            TABLE_TYPE_DWD,                            // 10. DWD
+            TABLE_TYPE_EFDT
         };
         int num_types = sizeof(display_order) / sizeof(display_order[0]);
 
@@ -8015,6 +6830,21 @@ void generate_html_report(const char* filename) {
                         fprintf(f, "</pre></div></details>\n");
                         break;
                     }
+                    case TABLE_TYPE_EFDT: {
+                        fdt_count++;
+                        FDTInstanceData* fdt_data = (FDTInstanceData*)g_lls_tables[j].parsed_data;
+                        fprintf(f, "<details><summary>Extended File Description Table (EFDT) Instance %d (Expires: %s)</summary>\n", fdt_count, fdt_data->expires);
+                        fprintf(f, "<div class='details-content'><table>\n<thead><tr><th>Content Location</th><th>TOI</th><th>Content Length</th><th>Content Type</th></tr></thead>\n<tbody>\n");
+                        FDTFileInfo* file = fdt_data->head;
+                        while(file) {
+                            fprintf(f, "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n", file->contentLocation, file->toi, file->contentLength, file->contentType);
+                            file = file->next;
+                        }
+                        fprintf(f, "</tbody></table><h4>Raw XML</h4><pre>");
+                        fprintf_escaped_xml(f, g_lls_tables[j].content_id);
+                        fprintf(f, "</pre></div></details>\n");
+                        break;
+                    }
                     case TABLE_TYPE_SERVICE_SIGNALING: {
                         service_signaling_count++;
                         ServiceSignalingData* meta_data = (ServiceSignalingData*)g_lls_tables[j].parsed_data;
@@ -8028,6 +6858,12 @@ void generate_html_report(const char* filename) {
                         fprintf(f, "</tbody></table><h4>Raw XML</h4><pre>");
                         fprintf_escaped_xml(f, g_lls_tables[j].content_id);
                         fprintf(f, "</pre></div></details>\n");
+                        
+                        // For MMT streams, display descriptor details after first service signaling instance
+                        if (strcmp(service->slsProtocol, "2") == 0 && service_signaling_count == 1) {
+                            generate_mmt_descriptor_details(f, service, 1);
+                        }
+                        
                         break;
                     }
                     case TABLE_TYPE_STSID: {
@@ -8071,68 +6907,18 @@ void generate_html_report(const char* filename) {
                         fprintf(f, "</pre></div></details>\n");
                         break;
                     }
+                    
                     case TABLE_TYPE_MP_TABLE_BINARY: {
-                        mp_table_binary_count++;
-                        ProprietaryMptData* mpt_data = (ProprietaryMptData*)g_lls_tables[j].parsed_data;
-                        
-                        if (!mpt_data || !mpt_data->assets) {
-                            fprintf(f, "<details><summary>MMT Package Table Instance %d - No Data</summary></details>\n", 
-                                    mp_table_binary_count);
-                            break;
-                        }
-                        
-                        fprintf(f, "<details><summary>MMT Package Table (MPT) Instance %d - Package: %s</summary>\n", 
-                                mp_table_binary_count, 
-                                mpt_data->package_descriptor[0] ? mpt_data->package_descriptor : "Unknown");
-                        fprintf(f, "<div class='details-content'>\n");
-                        
-                        // MPT Header
-                        fprintf(f, "<h4>MPT Information</h4>\n");
-                        fprintf(f, "<table><tr><th>Field</th><th>Value</th></tr>\n");
-                        fprintf(f, "<tr><td><strong>Table ID</strong></td><td>0x%02X</td></tr>\n", mpt_data->table_id);
-                        fprintf(f, "<tr><td><strong>Version</strong></td><td>%d</td></tr>\n", mpt_data->version);
-                        fprintf(f, "<tr><td><strong>Package Descriptor</strong></td><td>%s</td></tr>\n", 
-                                mpt_data->package_descriptor);
-                        fprintf(f, "<tr><td><strong>Number of Assets</strong></td><td>%d</td></tr>\n", mpt_data->num_assets);
-                        fprintf(f, "</table>\n");
-                        
-                        // Assets
-                        fprintf(f, "<h4>Assets</h4>\n");
-                        fprintf(f, "<table>\n<thead><tr><th>Packet ID</th><th>Asset Type</th><th>Codec</th><th>Asset ID</th></tr></thead>\n<tbody>\n");
-                        
-                        ProprietaryMptAsset* asset = mpt_data->assets;
+                        found_items_for_service = 1;
+                        BinaryMptData* binary_mpt = (BinaryMptData*)g_lls_tables[j].parsed_data;
+                        fprintf(f, "<details><summary>MMT Signaling (MP Table - Binary)</summary>\n");
+                        fprintf(f, "<div class='details-content'><h4>Binary MMT Package Table</h4><table>\n<thead><tr><th>Asset ID</th><th>Asset Type</th><th>Codec</th><th>Packet ID</th></tr></thead>\n<tbody>\n");
+                        BinaryMptAsset* asset = binary_mpt->head_asset;
                         while(asset) {
-                            fprintf(f, "<tr><td><strong>%u</strong></td><td>%s</td><td>%s</td><td>%s</td></tr>\n", 
-                                    asset->packet_id, asset->asset_type, asset->codec, asset->asset_id);
+                            fprintf(f, "<tr><td>%s</td><td>%s</td><td>%s</td><td>%u</td></tr>\n", 
+                                   asset->assetId, asset->assetType, asset->codec, asset->packetId);
                             asset = asset->next;
                         }
-                        
-                        fprintf(f, "</tbody></table></div></details>\n");
-                        break;
-                    }
-                    case TABLE_TYPE_MP_TABLE_PATTERN_MATCHED: {
-                        mp_table_binary_count++;
-                        BinaryMptData* bin_mpt_data = (BinaryMptData*)g_lls_tables[j].parsed_data;
-                        
-                        if (!bin_mpt_data || !bin_mpt_data->head_asset) {
-                            fprintf(f, "<details><summary>MMT Package Table Instance %d (Pattern Matched) - No Data</summary></details>\n", 
-                                    mp_table_binary_count);
-                            break;
-                        }
-                        
-                        fprintf(f, "<details><summary>MMT Package Table (MPT) Instance %d (Pattern Matched)</summary>\n", mp_table_binary_count);
-                        fprintf(f, "<div class='details-content'>\n");
-                        fprintf(f, "<p><em>Note: This MPT was parsed using pattern matching due to non-standard format.</em></p>\n");
-                        fprintf(f, "<h4>Assets</h4>\n");
-                        fprintf(f, "<table>\n<thead><tr><th>Packet ID</th><th>Asset Type</th><th>Codec</th><th>Asset ID</th></tr></thead>\n<tbody>\n");
-                        
-                        BinaryMptAsset* asset = bin_mpt_data->head_asset;
-                        while(asset) {
-                            fprintf(f, "<tr><td><strong>%u</strong></td><td>%s</td><td>%s</td><td>%s</td></tr>\n", 
-                                    asset->packetId, asset->assetType, asset->codec, asset->assetId);
-                            asset = asset->next;
-                        }
-                        
                         fprintf(f, "</tbody></table></div></details>\n");
                         break;
                     }
@@ -8170,6 +6956,27 @@ void generate_html_report(const char* filename) {
                     bss_info = bss_info->next;
                 }
             }
+        }
+
+        // Check for MMT Stream Parameters (VSPD, ASPD, CAD descriptors)
+        // This is similar to how we display MPD for ROUTE services
+        
+        ServiceDescriptors* descriptors = get_service_descriptors();
+        int count = get_service_descriptor_count();
+        
+        ServiceDescriptors* svc_descriptors = NULL;
+        for (int desc_idx = 0; desc_idx < count; desc_idx++) {
+            if (strcmp(descriptors[desc_idx].destinationIp, service->slsDestinationIpAddress) == 0 &&
+                    strcmp(descriptors[desc_idx].destinationPort, service->slsDestinationUdpPort) == 0) {
+                svc_descriptors = &descriptors[desc_idx];
+                break;
+            }
+        }
+        
+        if (svc_descriptors && (svc_descriptors->vspd || svc_descriptors->aspd || svc_descriptors->cad)) {
+            found_items_for_service = 1;
+            // Use the detailed descriptor function that includes helpful descriptions
+            generate_mmt_descriptor_details(f, service, 1);
         }
 
         if (!found_items_for_service) {
@@ -8262,33 +7069,33 @@ void generate_html_report(const char* filename) {
                         }
                         break;
                     }
-                    case TABLE_TYPE_SYSTEM_TIME:
-                    // System Time
-                    int found_system_time = 0;
-                    for (int i = 0; i < g_lls_table_count; i++) {
-                        if (g_lls_tables[i].type == TABLE_TYPE_SYSTEM_TIME) {
-                            found_system_time = 1;
-                            SystemTimeData* time_data = (SystemTimeData*)g_lls_tables[i].parsed_data;
-                            fprintf(f, "<details><summary>System Time Details - Actual Timestamp in L1Detail</summary><div class='details-content'>\n");
-                            fprintf(f, "<table>\n<thead><tr><th>Attribute</th><th>Value</th></tr></thead>\n<tbody>\n");
-                            if (time_data->currentUtcOffset[0] != '\0') { fprintf(f, "<tr><td>currentUtcOffset</td><td>%s</td></tr>\n", time_data->currentUtcOffset); }
-                            if (time_data->ptpPrepend[0] != '\0') { fprintf(f, "<tr><td>ptpPrepend</td><td>%s</td></tr>\n", time_data->ptpPrepend); }
-                            if (time_data->leap59[0] != '\0') { fprintf(f, "<tr><td>leap59</td><td>%s</td></tr>\n", time_data->leap59); }
-                            if (time_data->leap61[0] != '\0') { fprintf(f, "<tr><td>leap61</td><td>%s</td></tr>\n", time_data->leap61); }
-                            if (time_data->utcLocalOffset[0] != '\0') { fprintf(f, "<tr><td>utcLocalOffset</td><td>%s</td></tr>\n", time_data->utcLocalOffset); }
-                            if (time_data->dsStatus[0] != '\0') { fprintf(f, "<tr><td>dsStatus</td><td>%s</td></tr>\n", time_data->dsStatus); }
-                            if (time_data->dsDayOfMonth[0] != '\0') { fprintf(f, "<tr><td>dsDayOfMonth</td><td>%s</td></tr>\n", time_data->dsDayOfMonth); }
-                            if (time_data->dsHour[0] != '\0') { fprintf(f, "<tr><td>dsHour</td><td>%s</td></tr>\n", time_data->dsHour); }
-                            fprintf(f, "</tbody></table>\n");
-                            fprintf(f, "<details><summary>Raw XML</summary><pre>");
-                            fprintf_escaped_xml(f, g_lls_tables[i].content_id);
-                            fprintf(f, "</pre></details></div></details>\n");
-                            break; // Only show first System Time
+                    case TABLE_TYPE_SYSTEM_TIME: {
+                        int found_system_time = 0;
+                        for (int i = 0; i < g_lls_table_count; i++) {
+                            if (g_lls_tables[i].type == TABLE_TYPE_SYSTEM_TIME) {
+                                found_system_time = 1;
+                                SystemTimeData* time_data = (SystemTimeData*)g_lls_tables[i].parsed_data;
+                                fprintf(f, "<details><summary>System Time Details - Actual Timestamp in L1Detail</summary><div class='details-content'>\n");
+                                fprintf(f, "<table>\n<thead><tr><th>Attribute</th><th>Value</th></tr></thead>\n<tbody>\n");
+                                if (time_data->currentUtcOffset[0] != '\0') { fprintf(f, "<tr><td>currentUtcOffset</td><td>%s</td></tr>\n", time_data->currentUtcOffset); }
+                                if (time_data->ptpPrepend[0] != '\0') { fprintf(f, "<tr><td>ptpPrepend</td><td>%s</td></tr>\n", time_data->ptpPrepend); }
+                                if (time_data->leap59[0] != '\0') { fprintf(f, "<tr><td>leap59</td><td>%s</td></tr>\n", time_data->leap59); }
+                                if (time_data->leap61[0] != '\0') { fprintf(f, "<tr><td>leap61</td><td>%s</td></tr>\n", time_data->leap61); }
+                                if (time_data->utcLocalOffset[0] != '\0') { fprintf(f, "<tr><td>utcLocalOffset</td><td>%s</td></tr>\n", time_data->utcLocalOffset); }
+                                if (time_data->dsStatus[0] != '\0') { fprintf(f, "<tr><td>dsStatus</td><td>%s</td></tr>\n", time_data->dsStatus); }
+                                if (time_data->dsDayOfMonth[0] != '\0') { fprintf(f, "<tr><td>dsDayOfMonth</td><td>%s</td></tr>\n", time_data->dsDayOfMonth); }
+                                if (time_data->dsHour[0] != '\0') { fprintf(f, "<tr><td>dsHour</td><td>%s</td></tr>\n", time_data->dsHour); }
+                                fprintf(f, "</tbody></table>\n");
+                                fprintf(f, "<details><summary>Raw XML</summary><pre>");
+                                fprintf_escaped_xml(f, g_lls_tables[i].content_id);
+                                fprintf(f, "</pre></details></div></details>\n");
+                                break; // Only show first System Time
+                            }
                         }
-                    }
-                    if (!found_system_time) {
-                        fprintf(f, "<details><summary>System Time Details - Not Found</summary>\n");
-                        fprintf(f, "<div class='details-content'><p class='not-found'>No System Time tables found in this capture.</p></div></details>\n");
+                        if (!found_system_time) {
+                            fprintf(f, "<details><summary>System Time Details - Not Found</summary>\n");
+                            fprintf(f, "<div class='details-content'><p class='not-found'>No System Time tables found in this capture.</p></div></details>\n");
+                        }
                     }
                     default: break;
                 }
@@ -8363,6 +7170,9 @@ void generate_html_report(const char* filename) {
  * @brief Frees all globally allocated memory.
  */
 void cleanup() {
+    ServiceDescriptors* descriptors = get_service_descriptors();
+    int descriptor_count = get_service_descriptor_count();
+    
     for (int i = 0; i < g_lls_table_count; i++) {
         free(g_lls_tables[i].content_id);
         free_parsed_data(&g_lls_tables[i]);
@@ -8374,6 +7184,25 @@ void cleanup() {
     if (get_enhanced_l1_signaling_data()) {
         free_enhanced_l1_signaling_data(get_enhanced_l1_signaling_data());
         set_enhanced_l1_signaling_data(NULL);
+    }
+    
+    // Free service descriptors
+    for (int i = 0; i < descriptor_count; i++) {
+        if (descriptors[i].vspd) {
+            free(descriptors[i].vspd);
+        }
+        if (descriptors[i].aspd) {
+            free(descriptors[i].aspd);
+        }
+        if (descriptors[i].cad) {
+            CadEntry* current = descriptors[i].cad->head;
+            while (current) {
+                CadEntry* next = current->next;
+                free(current);
+                current = next;
+            }
+            free(descriptors[i].cad);
+        }
     }
 }
 
@@ -8444,6 +7273,9 @@ void free_parsed_data(LlsTable* table) {
         case TABLE_TYPE_FDT:
             free_fdt_data((FDTInstanceData*)table->parsed_data);
             break;
+        case TABLE_TYPE_EFDT:
+            free_fdt_data((FDTInstanceData*)table->parsed_data);
+            break;
         case TABLE_TYPE_MPD:
             free_mpd_data((MpdData*)table->parsed_data);
             break;
@@ -8496,15 +7328,19 @@ void free_parsed_data(LlsTable* table) {
         case TABLE_TYPE_MP_TABLE_XML:
             free_mp_table_data((MpTableData*)table->parsed_data);
             break;
-        case TABLE_TYPE_MP_TABLE_BINARY:
-            // This is now ONLY ProprietaryMptData
-            free_proprietary_mpt_data((ProprietaryMptData*)table->parsed_data);
+        case TABLE_TYPE_MP_TABLE_BINARY: {
+            BinaryMptData* binary_mpt = (BinaryMptData*)table->parsed_data;
+            if (binary_mpt) {
+                BinaryMptAsset* asset = binary_mpt->head_asset;
+                while (asset) {
+                    BinaryMptAsset* next = asset->next;
+                    free(asset);
+                    asset = next;
+                }
+                free(binary_mpt);
+            }
             break;
-
-        case TABLE_TYPE_MP_TABLE_PATTERN_MATCHED:
-            // This is the old BinaryMptData
-            free_binary_mp_table_data((BinaryMptData*)table->parsed_data);
-            break;
+        }
         case TABLE_TYPE_CDT: {
             CdtData* cdt_data = (CdtData*)table->parsed_data;
             if (cdt_data) {
@@ -8696,20 +7532,6 @@ void free_mp_table_data(MpTableData* data) {
 }
 
 /**
- * @brief Frees memory for a BinaryMptData struct and its linked list of assets.
- */
-void free_binary_mp_table_data(BinaryMptData* data) {
-    if (!data) return;
-    BinaryMptAsset* current = data->head_asset;
-    while (current != NULL) {
-        BinaryMptAsset* next = current->next;
-        free(current);
-        current = next;
-    }
-    free(data);
-}
-
-/**
  * @brief Frees memory for a UctData struct and its contents.
  */
 void free_uct_data(UctData* data) {
@@ -8745,4 +7567,3 @@ void free_udst_data(UdstData* data) {
     }
     free(data);
 }
-

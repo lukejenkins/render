@@ -373,12 +373,27 @@ int create_virtual_pcap_from_debug(const char *debug_filename, uint8_t **pcap_da
 int parse_alp_packet(const u_char* alp_data, int alp_len, const u_char** ip_payload, int* ip_len, 
                      const u_char** signaling_payload, int* signaling_len) {
     if (alp_len < 2) {
+        printf("DEBUG parse_alp_packet: FAIL - alp_len too small (%d)\n", alp_len);
         return -1;
     }
     
     uint8_t first_byte = alp_data[0];
     uint8_t packet_type = (first_byte >> 5) & 0x07;
     uint8_t payload_config = (first_byte >> 4) & 0x01;
+    
+    // Suppress Sony manufacturer packets that fail to parse
+    if (alp_len < 7) {
+        return -1;
+    }
+    
+    printf("DEBUG parse_alp_packet: alp_len=%d, packet_type=%d, payload_config=%d\n", 
+           alp_len, packet_type, payload_config);
+    
+    printf("DEBUG parse_alp_packet: First 10 bytes: ");
+    for (int i = 0; i < (alp_len < 10 ? alp_len : 10); i++) {
+        printf("%02x ", alp_data[i]);
+    }
+    printf("\n");
     
     // Initialize output parameters
     *ip_payload = NULL;
@@ -394,7 +409,7 @@ int parse_alp_packet(const u_char* alp_data, int alp_len, const u_char** ip_payl
         // payload_config bits indicate the structure
         // If bit 3 (0x08) is set, length is 2 bytes
         // Otherwise length is 1 byte
-        if (payload_config & 0x08) {
+        if ((first_byte >> 3) & 0x01) {  // Check header_mode bit
             header_offset += 2;  // 2-byte length
         } else {
             header_offset += 1;  // 1-byte length

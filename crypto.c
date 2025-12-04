@@ -160,7 +160,7 @@ CertificateInfo* parse_x509_certificate(const char* cert_data, size_t cert_len) 
     // Extract public key information
     EVP_PKEY* pkey = X509_get_pubkey(cert);
     if (pkey) {
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
         int key_type = EVP_PKEY_get_base_id(pkey);
 #else
         int key_type = EVP_PKEY_type(pkey->type);
@@ -168,7 +168,7 @@ CertificateInfo* parse_x509_certificate(const char* cert_data, size_t cert_len) 
         switch(key_type) {
             case EVP_PKEY_RSA:
                 strcpy(cert_info->public_key_algorithm, "RSA");
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
                 cert_info->key_size = EVP_PKEY_get_bits(pkey);
 #else
                 cert_info->key_size = EVP_PKEY_bits(pkey);
@@ -176,7 +176,7 @@ CertificateInfo* parse_x509_certificate(const char* cert_data, size_t cert_len) 
                 break;
             case EVP_PKEY_EC:
                 strcpy(cert_info->public_key_algorithm, "EC");
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
                 cert_info->key_size = EVP_PKEY_get_bits(pkey);
 #else
                 cert_info->key_size = EVP_PKEY_bits(pkey);
@@ -184,7 +184,7 @@ CertificateInfo* parse_x509_certificate(const char* cert_data, size_t cert_len) 
                 break;
             case EVP_PKEY_DSA:
                 strcpy(cert_info->public_key_algorithm, "DSA");
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
                 cert_info->key_size = EVP_PKEY_get_bits(pkey);
 #else
                 cert_info->key_size = EVP_PKEY_bits(pkey);
@@ -192,7 +192,7 @@ CertificateInfo* parse_x509_certificate(const char* cert_data, size_t cert_len) 
                 break;
             default:
                 strcpy(cert_info->public_key_algorithm, "Unknown");
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
                 cert_info->key_size = EVP_PKEY_get_bits(pkey);
 #else
                 cert_info->key_size = EVP_PKEY_bits(pkey);

@@ -79,6 +79,7 @@ struct plp_info_t {
     int ti_mode;
     int HTI_num_fec_blocks;
     long size;
+    int subframe_index;
 };
 
 // SNR lookup result structure
@@ -121,8 +122,7 @@ double calculate_atsc3_bitrate_l1(int fft_size_enum, int guardinterval, int nump
                                  int pilotpattern, int firstsbs, int cred, int pilotboost, 
                                  int paprmode, int ti_mode, int fec_blocks, int l1_detail_cells, 
                                  int subframe, int num_subframes, struct subframe_info_t *subframe_info, 
-                                 int frame_length_mode, int frame_length, int excess_samples, 
-                                 long plp_size_cells);
+                                 int frame_length_mode, int frame_length, int excess_samples);
 
 // Base64 decoding functions
 size_t b64_decoded_size_l1(const char *in);

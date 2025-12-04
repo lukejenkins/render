@@ -203,7 +203,9 @@ void parse_l1_field_line(const char* line, L1SignalingData* data) {
     }
     
     if (sscanf(line, "bsid=%15s", field_value) == 1) {
-        strncpy(data->l1_bsid, field_value, sizeof(data->l1_bsid) - 1);
+        //strncpy(data->l1_bsid, field_value, sizeof(data->l1_bsid) - 1);
+        long bsid_val = strtol(field_value, NULL, 0);
+        snprintf(data->l1_bsid, sizeof(data->l1_bsid), "%ld", bsid_val);
         return;
     }
     
@@ -404,7 +406,7 @@ EnhancedPlpInfo* parse_simple_plp_line(const char* line) {
         return NULL;
     }
     
-    // Parse other fields
+    // Parse sfi
     char* sfi_pos = strstr(line, "sfi=");
     if (sfi_pos && sscanf(sfi_pos, "sfi=%d", &plp->sfi) != 1) {
         plp->sfi = 0;
@@ -430,7 +432,7 @@ EnhancedPlpInfo* parse_simple_plp_line(const char* line) {
         }
     }
     
-    // Parse layer, ti_mode, flags
+    // Parse layer
     char* layer_pos = strstr(line, "layer=");
     if (layer_pos) {
         if (sscanf(layer_pos, "layer=%15s", plp->layer) == 1) {
@@ -440,6 +442,7 @@ EnhancedPlpInfo* parse_simple_plp_line(const char* line) {
         }
     }
     
+    // Parse TI mode
     char* ti_pos = strstr(line, "ti=");
     if (ti_pos) {
         if (sscanf(ti_pos, "ti=%7s", plp->ti_mode) == 1) {
@@ -449,15 +452,19 @@ EnhancedPlpInfo* parse_simple_plp_line(const char* line) {
         }
     }
     
+    // Parse LLS flag
     char* lls_pos = strstr(line, "lls=");
     if (lls_pos) {
         sscanf(lls_pos, "lls=%d", &plp->lls_flag);
     }
     
+    // Parse lock flag - if present, use it; if not present, default to 0 (not locked)
+    // calloc already initialized lock_flag to 0, so we only need to update if found
     char* lock_pos = strstr(line, "lock=");
     if (lock_pos) {
         sscanf(lock_pos, "lock=%d", &plp->lock_flag);
     }
+    // If lock_pos is NULL, lock_flag stays at 0 (not locked)
     
     return plp;
 }
@@ -555,6 +562,12 @@ EnhancedL1SignalingData* parse_l1_detail_from_base64(const char* base64_data) {
     for (int i = 0; i < detail_info->line_count; i++) {
         char* line = detail_info->display_lines[i];
         
+        // NEW: Track current subframe
+        static int current_subframe = 0;
+        if (strstr(line, "Subframe #") && strchr(line, ':')) {
+            sscanf(line, "Subframe #%d:", &current_subframe);
+        }
+        
         // Look for PLP ID lines first to establish context
         if (strstr(line, "L1D_plp_id:")) {
             continue;
@@ -570,6 +583,9 @@ EnhancedL1SignalingData* parse_l1_detail_from_base64(const char* base64_data) {
                 free(decoded_data);
                 return NULL;
             }
+            
+            // Set SFI to current subframe
+            plp->sfi = current_subframe;
             
             // Extract PLP number from header (this is just section numbering, not the actual ID)
             int section_number;
@@ -669,9 +685,37 @@ EnhancedL1SignalingData* parse_l1_detail_from_base64(const char* base64_data) {
                 }
             }
             
+            // Determine LDPC length from FEC type
+            int ldpc_length = -1;
+            if (strlen(plp->fec_type) > 0) {
+                if (strstr(plp->fec_type, "16K")) {
+                    ldpc_length = 0;  // Short
+                } else if (strstr(plp->fec_type, "64K")) {
+                    ldpc_length = 1;  // Long
+                }
+            }
+            
             // Compute SNR if we have modulation and code rate
             if (strlen(plp->modulation) > 0 && strlen(plp->code_rate) > 0) {
-                compute_snr_values(plp);
+                // Use the determined LDPC length
+                char normalized_mod[16];
+                normalize_mod_str_l1(plp->modulation, normalized_mod, sizeof(normalized_mod));
+                
+                struct snr_pair_result snr_result = get_snr_pair_for_modcod_l1(normalized_mod, plp->code_rate, ldpc_length);
+                
+                if (snr_result.found) {
+                    if (snr_result.ldpc_length_known) {
+                        plp->required_snr_awgn = snr_result.awgn_min;
+                        plp->required_snr_rayleigh = snr_result.rayleigh_min;
+                        plp->snr_range_available = 0;
+                    } else {
+                        plp->required_snr_awgn_min = snr_result.awgn_min;
+                        plp->required_snr_awgn_max = snr_result.awgn_max;
+                        plp->required_snr_rayleigh_min = snr_result.rayleigh_min;
+                        plp->required_snr_rayleigh_max = snr_result.rayleigh_max;
+                        plp->snr_range_available = 1;
+                    }
+                }
             }
             
             // Add to linked list
@@ -690,16 +734,16 @@ EnhancedL1SignalingData* parse_l1_detail_from_base64(const char* base64_data) {
     return enhanced_data;
 }
 
-// Modified parse_enhanced_l1_signaling_file function to always parse base64 when available
+// Modified parse_enhanced_l1_signaling_file to correctly populate l1_base64 for display
 EnhancedL1SignalingData* parse_enhanced_l1_signaling_file(const char* txt_filename) {
     FILE* f = fopen(txt_filename, "r");
     if (!f) {
-        return NULL; // File doesn't exist, which is fine
+        return NULL; // File doesn't exist
     }
     
     printf("Found L1 signaling file: %s\n", txt_filename);
     
-    // Read entire file content first
+    // Read entire file content to pre-scan for Base64
     fseek(f, 0, SEEK_END);
     long file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -721,37 +765,37 @@ EnhancedL1SignalingData* parse_enhanced_l1_signaling_file(const char* txt_filena
         return NULL;
     }
     
-    // Store the original content
     data->original_text_content = file_content;
     
+    int prefer_base64 = 0;
+    if (strstr(file_content, "Raw L1 Detail (Base64):")) {
+        prefer_base64 = 1;
+        printf("DEBUG: Base64 section found. PLP details will be parsed directly from Base64.\n");
+    }
+
     char line[1024];
     EnhancedPlpInfo* plp_tail = NULL;
     char* base64_buffer = NULL;
     size_t base64_size = 0;
     int in_base64_section = 0;
-    int has_base64_section = 0; // Track if we found a base64 section
-    int current_plp_context = -1; // Track which PLP context we're in for bitrate assignment
+    
+    // NEW: Store simple PLP info (with lock status) before parsing base64
+    EnhancedPlpInfo* simple_plp_head = NULL;
+    EnhancedPlpInfo* simple_plp_tail = NULL;
     
     while (fgets(line, sizeof(line), f)) {
-        // Remove trailing newline
         line[strcspn(line, "\r\n")] = '\0';
         
-        // Skip empty lines and separator lines
         if (strlen(line) == 0 || strstr(line, "__HLINE__") || strstr(line, "====")) {
             continue;
         }
         
-        // Check for base64 section start
         if (strstr(line, "Raw L1 Detail (Base64):")) {
             in_base64_section = 1;
-            has_base64_section = 1; // Mark that we found a base64 section
-            printf("DEBUG: Found base64 section header\n");
             continue;
         }
         
-        // If in base64 section, accumulate base64 data
         if (in_base64_section) {
-            // Check if this looks like base64 data
             int is_base64_line = 1;
             for (int i = 0; line[i] && i < 100; i++) {
                 char c = line[i];
@@ -760,43 +804,45 @@ EnhancedL1SignalingData* parse_enhanced_l1_signaling_file(const char* txt_filena
                     break;
                 }
             }
-            
             if (is_base64_line && strlen(line) > 10) {
-                // Accumulate base64 data
                 size_t line_len = strlen(line);
                 base64_buffer = realloc(base64_buffer, base64_size + line_len + 1);
                 if (base64_buffer) {
                     strcpy(base64_buffer + base64_size, line);
                     base64_size += line_len;
                 }
-            } else {
-                printf("DEBUG: Skipping non-base64 line or too short\n");
             }
             continue;
         }
         
-        // Check if this is a PLP line (starts with digit followed by colon)
         if (isdigit(line[0]) && strchr(line, ':') && strchr(line, '=')) {
-            // Check if next line contains SNR info
+            EnhancedPlpInfo* simple_plp = parse_simple_plp_line(line);
+            if (simple_plp) {
+                if (!simple_plp_head) {
+                    simple_plp_head = simple_plp;
+                    simple_plp_tail = simple_plp;
+                } else {
+                    simple_plp_tail->next = simple_plp;
+                    simple_plp_tail = simple_plp;
+                }
+            }
+        }
+        
+        if (!prefer_base64 && isdigit(line[0]) && strchr(line, ':') && strchr(line, '=')) {
             char next_line[1024] = "";
             long pos = ftell(f);
             if (fgets(next_line, sizeof(next_line), f)) {
                 next_line[strcspn(next_line, "\r\n")] = '\0';
-                fseek(f, pos, SEEK_SET); // Reset position
+                fseek(f, pos, SEEK_SET);
             }
             
             EnhancedPlpInfo* plp = NULL;
             if (strstr(next_line, "Required SNR:")) {
-                // Parse with existing SNR
                 plp = parse_plp_with_snr(line, next_line);
-                // Skip the SNR line
                 fgets(next_line, sizeof(next_line), f);
             } else {
-                // Parse simple line and compute SNR
                 plp = parse_simple_plp_line(line);
-                if (plp) {
-                    compute_snr_values(plp);
-                }
+                if (plp) compute_snr_values(plp);
             }
             
             if (plp) {
@@ -809,137 +855,92 @@ EnhancedL1SignalingData* parse_enhanced_l1_signaling_file(const char* txt_filena
                 }
             }
         } else {
-            // Handle other L1 field lines AND bitrate extraction
             parse_l1_field_line(line, (L1SignalingData*)data);
-            
-            // ONLY handle bitrate lines directly here if we don't have a base64 section
-            // If we have base64, let the base64 parser handle bitrates more accurately
-            if (!has_base64_section && strstr(line, "-> PLP Bitrate:")) {
-                //printf("DEBUG: Found bitrate line in text-only file: %s\n", line);
-                float bitrate = 0.0;
-                if (sscanf(line, "%*[^0-9]%f", &bitrate) == 1 && bitrate > 0.0) {
-                    // Find the PLP that this bitrate belongs to based on context
-                    EnhancedPlpInfo* target_plp = NULL;
-                    if (current_plp_context >= 0) {
-                        // Look for PLP with the current context ID
-                        target_plp = data->plp_head;
-                        while (target_plp) {
-                            if (target_plp->plp_id == current_plp_context) {
-                                break;
-                            }
-                            target_plp = target_plp->next;
-                        }
-                    }
-                    
-                    if (!target_plp) {
-                        // Fallback: use most recent PLP
-                        target_plp = data->plp_head;
-                        while (target_plp && target_plp->next) {
-                            target_plp = target_plp->next;
-                        }
-                    }
-                }
-            }
-            
-            // Track PLP context for bitrate assignment
-            if (strstr(line, "PLP #") && strchr(line, ':')) {
-                // Extract PLP ID from context line like "    PLP #0:"
-                int plp_id;
-                if (sscanf(line, "%*[^#]#%d:", &plp_id) == 1) {
-                    current_plp_context = plp_id;
-                }
-            } else if (strstr(line, "L1D_plp_id:")) {
-                // Extract PLP ID from detail line like "      L1D_plp_id: 0"
-                int plp_id;
-                if (sscanf(line, "%*[^:]: %d", &plp_id) == 1) {
-                    current_plp_context = plp_id;
-                }
-            }
         }
     }
     
-    // Handle different base64 formats:
-    // 1. base64_buffer: from "Raw L1 Detail (Base64):" section 
-    // 2. data->l1_base64: from standalone base64 lines parsed by parse_l1_field_line
     char* base64_to_parse = NULL;
-    
     if (base64_buffer && base64_size > 0) {
-        // Format with "Raw L1 Detail (Base64):" header
-        printf("DEBUG: Using base64 from dedicated section (size: %zu)\n", base64_size);
         base64_to_parse = base64_buffer;
     } else if (strlen(data->l1_base64) > 0) {
-        // Simple format with standalone base64 line
-        printf("DEBUG: Using base64 from standalone line: %.50s...\n", data->l1_base64);
         base64_to_parse = data->l1_base64;
     }
     
+    // *** FIX IS HERE: Copy the discovered Base64 string to the main data struct ***
     if (base64_to_parse) {
-        printf("DEBUG: Parsing base64 data for enhanced PLP details\n");
+        // Clean up the string by removing whitespace and copy it to data->l1_base64
+        size_t dest_idx = 0;
+        for (size_t i = 0; base64_to_parse[i] && dest_idx < sizeof(data->l1_base64) - 1; i++) {
+            if (!isspace(base64_to_parse[i])) {
+                data->l1_base64[dest_idx++] = base64_to_parse[i];
+            }
+        }
+        data->l1_base64[dest_idx] = '\0';
         
-        // Parse base64 to get detailed PLP info
-        EnhancedL1SignalingData* base64_data = parse_l1_detail_from_base64(base64_to_parse);
+        // Now use this cleaned string for parsing PLPs
+        EnhancedL1SignalingData* base64_data = parse_l1_detail_from_base64(data->l1_base64);
         
         if (base64_data && base64_data->plp_head) {
-            printf("DEBUG: Base64 parsing succeeded\n");
+            // Count PLPs for single-PLP special case
+            int total_plp_count = 0;
+            EnhancedPlpInfo* count_plp = base64_data->plp_head;
+            while (count_plp) {
+                total_plp_count++;
+                count_plp = count_plp->next;
+            }
             
-            // Merge bitrate information from base64 data into existing PLPs
+            // Merge lock status from simple_plp_head into base64_data PLPs
             EnhancedPlpInfo* base64_plp = base64_data->plp_head;
-            
             while (base64_plp) {
-                printf("DEBUG: Processing base64 PLP %d with bitrate %f\n", 
-                       base64_plp->plp_id, base64_plp->bitrate_mbps);
-                
-                // Find corresponding PLP in main data
-                EnhancedPlpInfo* main_plp = data->plp_head;
-                while (main_plp) {
-                    if (main_plp->plp_id == base64_plp->plp_id) {
-                        // Copy missing information from base64 parsing
-                        // For bitrate, always prefer base64 data over text parsing
-                        if (base64_plp->bitrate_mbps > 0.0) {
-                            if (main_plp->bitrate_mbps != base64_plp->bitrate_mbps) {
-                                printf("DEBUG: Overriding PLP %d bitrate from %f to %f (base64 is more accurate)\n", 
-                                       main_plp->plp_id, main_plp->bitrate_mbps, base64_plp->bitrate_mbps);
-                            }
-                            main_plp->bitrate_mbps = base64_plp->bitrate_mbps;
-                        }
-                        
-                        // Copy other enhanced fields if missing
-                        if (strlen(main_plp->fec_type) == 0 && strlen(base64_plp->fec_type) > 0) {
-                            strcpy(main_plp->fec_type, base64_plp->fec_type);
-                        }
-                        if (main_plp->plp_size == 0 && base64_plp->plp_size > 0) {
-                            main_plp->plp_size = base64_plp->plp_size;
-                        }
-                        if (strlen(main_plp->plp_type) == 0 && strlen(base64_plp->plp_type) > 0) {
-                            strcpy(main_plp->plp_type, base64_plp->plp_type);
-                        }
-                        
+                // Find matching PLP in simple list by ID
+                int found_simple = 0;
+                EnhancedPlpInfo* simple_plp = simple_plp_head;
+                while (simple_plp) {
+                    if (simple_plp->plp_id == base64_plp->plp_id) {
+                        // Copy lock status from simple PLP (0 or 1)
+                        base64_plp->lock_flag = simple_plp->lock_flag;
+                        found_simple = 1;
                         break;
                     }
-                    main_plp = main_plp->next;
+                    simple_plp = simple_plp->next;
                 }
+                
+                // If no matching simple PLP found, set to unknown (-1)
+                // UNLESS there's only one PLP, in which case it must be locked (1)
+                if (!found_simple) {
+                    if (total_plp_count == 1) {
+                        base64_plp->lock_flag = 1;  // Single PLP must be locked
+                    } else {
+                        base64_plp->lock_flag = -1;  // Unknown for multi-PLP
+                    }
+                }
+                
                 base64_plp = base64_plp->next;
             }
             
-            // If no PLPs existed in main data, use the base64 PLPs
-            if (!data->plp_head) {
-                data->plp_head = base64_data->plp_head;
-                base64_data->plp_head = NULL; // Transfer ownership
-            }
+            data->plp_head = base64_data->plp_head;
+            base64_data->plp_head = NULL;
         }
+        
         if (base64_data) {
-            free(base64_data);
+            free_enhanced_l1_signaling_data(base64_data);
         }
     }
     
-    // Clean up the base64_buffer if it exists
+    // NEW: Free the simple PLP list
+    EnhancedPlpInfo* current = simple_plp_head;
+    while (current) {
+        EnhancedPlpInfo* next = current->next;
+        free(current);
+        current = next;
+    }
+    
     if (base64_buffer) {
         free(base64_buffer);
     }
     
     fclose(f);
     
-    // Count PLPs found
     int plp_count = 0;
     EnhancedPlpInfo* count_plp = data->plp_head;
     while (count_plp) {
@@ -948,12 +949,8 @@ EnhancedL1SignalingData* parse_enhanced_l1_signaling_file(const char* txt_filena
     }
     
     printf("Parsed enhanced L1 signaling data: %d PLPs", plp_count);
-    if (strlen(data->l1_bsid) > 0) {
-        printf(", L1 BSID: %s", data->l1_bsid);
-    }
-    if (strlen(data->l1_base64) > 0) {
-        printf(", L1Basic/Detail base64 (%zu chars)", strlen(data->l1_base64));
-    }
+    if (strlen(data->l1_bsid) > 0) printf(", L1 BSID: %s", data->l1_bsid);
+    if (strlen(data->l1_base64) > 0) printf(", L1Basic/Detail base64 (%zu chars)", strlen(data->l1_base64));
     printf("\n");
     
     return data;

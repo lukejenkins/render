@@ -81,6 +81,435 @@ static const struct modcod_snr_complete {
     {{0}} // Sentinel
 };
 
+// Add the cell tables at the top of the file after the SNR table
+static const int preamble_cells_table[32][5] = {
+    {6432, 6342, 6253, 6164, 6075},
+    {6000, 5916, 5833, 5750, 5667},
+    {5712, 5632, 5553, 5474, 5395},
+    {5136, 5064, 4993, 4922, 4851},
+    {4560, 4496, 4433, 4370, 4307},
+    {5136, 5064, 4993, 4922, 4851},
+    {4560, 4496, 4433, 4370, 4307},
+    {13296, 13110, 12927, 12742, 12558},
+    {12864, 12684, 12507, 12328, 12150},
+    {12576, 12400, 12227, 12052, 11878},
+    {12000, 11832, 11667, 11500, 11334},
+    {11424, 11264, 11107, 10948, 10790},
+    {10272, 10128, 9987, 9844, 9702},
+    {9120, 8992, 8867, 8740, 8614},
+    {9120, 8992, 8867, 8740, 8614},
+    {10272, 10128, 9987, 9844, 9702},
+    {10272, 10128, 9987, 9844, 9702},
+    {9120, 8992, 8867, 8740, 8614},
+    {26592, 26220, 25854, 25484, 25116},
+    {26592, 26220, 25854, 25484, 25116},
+    {26304, 25936, 25574, 25208, 24844},
+    {25728, 25368, 25014, 24656, 24300},
+    {25152, 24800, 24454, 24104, 23756},
+    {24000, 23664, 23334, 23000, 22668},
+    {22848, 22528, 22214, 21896, 21580},
+    {22848, 22528, 22214, 21896, 21580},
+    {24000, 23664, 23334, 23000, 22668},
+    {18240, 17984, 17734, 17480, 17228},
+    {24000, 23664, 23334, 23000, 22668},
+    {18240, 17984, 17734, 17480, 17228},
+    {18240, 17984, 17734, 17480, 17228},
+    {18240, 17984, 17734, 17480, 17228}
+};
+
+static const int data_cells_table_8K[16][5] = {
+    {5711, 5631, 5552, 5473, 5394},
+    {6285, 6197, 6110, 6023, 5936},
+    {5999, 5915, 5832, 5749, 5666},
+    {6429, 6339, 6250, 6161, 6072},
+    {6287, 6199, 6112, 6025, 5938},
+    {6573, 6481, 6390, 6299, 6208},
+    {6431, 6341, 6252, 6163, 6074},
+    {6645, 6552, 6460, 6368, 6276},
+    {6575, 6483, 6392, 6301, 6210},
+    {6717, 6623, 6530, 6437, 6344},
+    {6647, 6554, 6462, 6370, 6278},
+    {6753, 6660, 6565, 6473, 6378},
+    {6719, 6625, 6532, 6439, 6346},
+    {6789, 6694, 6600, 6506, 6412},
+    {6755, 6661, 6567, 6474, 6380},
+    {6807, 6714, 6619, 6524, 6429}
+};
+
+static const int data_cells_table_16K[16][5] = {
+    {11423, 11263, 11106, 10947, 10789},
+    {12573, 12397, 12224, 12049, 11875},
+    {11999, 11831, 11666, 11499, 11333},
+    {12861, 12681, 12504, 12325, 12147},
+    {12575, 12399, 12226, 12051, 11877},
+    {13149, 12965, 12784, 12601, 12419},
+    {12863, 12683, 12506, 12327, 12149},
+    {13293, 13107, 12924, 12739, 12555},
+    {13151, 12967, 12786, 12603, 12421},
+    {13437, 13249, 13064, 12877, 12691},
+    {13295, 13109, 12926, 12741, 12557},
+    {13509, 13320, 13134, 12946, 12759},
+    {13439, 13251, 13066, 12879, 12693},
+    {13581, 13391, 13204, 13015, 12827},
+    {13511, 13322, 13136, 12948, 12761},
+    {13617, 13428, 13239, 13051, 12861}
+};
+
+static const int data_cells_table_32K[16][5] = {
+    {22847, 22527, 22213, 21895, 21579},
+    {25149, 24797, 24451, 24101, 23753},
+    {0, 0, 0, 0, 0},
+    {0, 0, 0, 0, 0},
+    {25151, 24799, 24453, 24103, 23755},
+    {26301, 25933, 25571, 25205, 24841},
+    {25727, 25367, 25013, 24655, 24299},
+    {26589, 26217, 25851, 25481, 25113},
+    {26303, 25935, 25573, 25207, 24843},
+    {26877, 26501, 26131, 25757, 25385},
+    {26591, 26219, 25853, 25483, 25115},
+    {27021, 26643, 26271, 25895, 25521},
+    {26879, 26503, 26133, 25759, 25387},
+    {27165, 26785, 26411, 26033, 25657},
+    {27023, 26645, 26273, 25897, 25523},
+    {27237, 26856, 26481, 26102, 25725}
+};
+
+static const int sbs_cells_table_8K[16][5] = {
+    {4560, 4496, 4433, 4370, 4307},
+    {4560, 4496, 4433, 4370, 4307},
+    {5136, 5064, 4993, 4922, 4851},
+    {5136, 5064, 4993, 4922, 4851},
+    {5712, 5632, 5553, 5474, 5395},
+    {5712, 5632, 5553, 5474, 5395},
+    {6000, 5916, 5833, 5750, 5667},
+    {6000, 5916, 5833, 5750, 5667},
+    {6288, 6200, 6113, 6026, 5939},
+    {6288, 6200, 6113, 6026, 5939},
+    {6432, 6342, 6253, 6164, 6075},
+    {6432, 6342, 6253, 6164, 6075},
+    {6576, 6484, 6393, 6302, 6211},
+    {6576, 6484, 6393, 6302, 6211},
+    {6648, 6555, 6463, 6371, 6279},
+    {6648, 6555, 6463, 6371, 6279},
+};
+
+static const int sbs_cells_table_16K[16][5] = {
+    {9120, 8992, 8867, 8740, 8614},
+    {9120, 8992, 8867, 8740, 8614},
+    {10272, 10128, 9987, 9844, 9702},
+    {10272, 10128, 9987, 9844, 9702},
+    {11424, 11264, 11107, 10948, 10790},
+    {11424, 11264, 11107, 10948, 10790},
+    {12000, 11832, 11667, 11500, 11334},
+    {12000, 11832, 11667, 11500, 11334},
+    {12576, 12400, 12227, 12052, 11878},
+    {12576, 12400, 12227, 12052, 11878},
+    {12864, 12684, 12507, 12328, 12150},
+    {12864, 12684, 12507, 12328, 12150},
+    {13152, 12968, 12787, 12604, 12422},
+    {13152, 12968, 12787, 12604, 12422},
+    {13296, 13110, 12927, 12742, 12558},
+    {13296, 13110, 12927, 12742, 12558}
+};
+
+static const int sbs_cells_table_32K[16][5] = {
+    {18240, 17984, 17734, 17480, 17228},
+    {18240, 17984, 17734, 17480, 17228},
+    {0, 0, 0, 0, 0},
+    {0, 0, 0, 0, 0},
+    {22848, 22528, 22214, 21896, 21580},
+    {22848, 22528, 22214, 21896, 21580},
+    {24000, 23664, 23334, 23000, 22668},
+    {24000, 23664, 23334, 23000, 22668},
+    {25152, 24800, 24454, 24104, 23756},
+    {25152, 24800, 24454, 24104, 23756},
+    {25728, 25368, 25014, 24656, 24300},
+    {25728, 25368, 25014, 24656, 24300},
+    {26304, 25936, 25574, 25208, 24844},
+    {26304, 25936, 25574, 25208, 24844},
+    {26592, 26220, 25854, 25484, 25116},
+    {26592, 26220, 25854, 25484, 25116}
+};
+
+static const int sbs_data_cells_table_8K[16][5][5] = {
+    {{4560, 4560, 4123, 3801, 3467}, {4496, 4496, 4065, 3748, 3418}, {4433, 4433, 4008, 3695, 3371}, {4370, 4370, 3951, 3643, 3323}, {4307, 4307, 3894, 3591, 3275}},
+    {{4560, 3904, 2922, 2148, 1534}, {4496, 3849, 2881, 2117, 1513}, {4433, 3796, 2841, 2088, 1492}, {4370, 3742, 2800, 2058, 1471}, {4307, 3688, 2760, 2029, 1450}},
+    {{5136, 5009, 4600, 4278, 4022}, {5064, 4938, 4535, 4218, 3966}, {4993, 4869, 4472, 4158, 3910}, {4922, 4800, 4408, 4099, 3855}, {4851, 4731, 4345, 4040, 3799}},
+    {{5136, 4332, 3467, 2868, 2245}, {5064, 4272, 3419, 2828, 2214}, {4993, 4212, 3371, 2788, 2183}, {4922, 4152, 3323, 2749, 2152}, {4851, 4092, 3275, 2710, 2121}},
+    {{5712, 5456, 5114, 4843, 4629}, {5632, 5380, 5042, 4775, 4564}, {5553, 5304, 4971, 4708, 4500}, {5474, 5229, 4901, 4641, 4436}, {5395, 5154, 4830, 4575, 4372}},
+    {{5712, 4856, 4147, 3588, 3146}, {5632, 4788, 4089, 3538, 3102}, {5553, 4720, 4032, 3488, 3058}, {5474, 4653, 3974, 3439, 3015}, {5395, 4586, 3917, 3390, 2972}},
+    {{6000, 5716, 5398, 5188, 4971}, {5916, 5636, 5322, 5116, 4901}, {5833, 5557, 5247, 5044, 4833}, {5750, 5478, 5173, 4972, 4764}, {5667, 5399, 5098, 4901, 4695}},
+    {{6000, 5168, 4558, 4078, 3697}, {5916, 5096, 4494, 4021, 3645}, {5833, 5024, 4432, 3964, 3595}, {5750, 4953, 4369, 3908, 3544}, {5667, 4881, 4306, 3852, 3493}},
+    {{6288, 5976, 5729, 5533, 5379}, {6200, 5892, 5648, 5456, 5304}, {6113, 5810, 5569, 5380, 5229}, {6026, 5727, 5490, 5303, 5155}, {5939, 5644, 5411, 5227, 5081}},
+    {{6288, 5508, 5010, 4616, 4305}, {6200, 5431, 4940, 4552, 4245}, {6113, 5355, 4870, 4488, 4186}, {6026, 5279, 4801, 4425, 4126}, {5939, 5203, 4732, 4361, 4067}},
+    {{6432, 6132, 5919, 5751, 5618}, {6342, 6046, 5836, 5671, 5540}, {6253, 5961, 5754, 5591, 5462}, {6164, 5876, 5672, 5512, 5385}, {6075, 5792, 5591, 5432, 5307}},
+    {{6432, 5691, 5252, 4906, 4633}, {6342, 5608, 5173, 4831, 4559}, {6253, 5532, 5106, 4770, 4504}, {6164, 5450, 5028, 4695, 4432}, {6075, 5375, 4961, 4635, 4377}},
+    {{6576, 6297, 6123, 5986, 5877}, {6484, 6209, 6038, 5902, 5795}, {6393, 6122, 5953, 5820, 5714}, {6302, 6035, 5868, 5737, 5633}, {6211, 5948, 5784, 5654, 5552}},
+    {{6576, 5922, 5564, 5282, 5058}, {6484, 5839, 5486, 5208, 4988}, {6393, 5757, 5409, 5135, 4918}, {6302, 5675, 5333, 5062, 4848}, {6211, 5594, 5256, 4990, 4779}},
+    {{6648, 6384, 6231, 6125, 6015}, {6555, 6294, 6142, 6037, 5928}, {6463, 6207, 6058, 5955, 5848}, {6371, 6117, 5970, 5868, 5762}, {6279, 6030, 5886, 5786, 5682}},
+    {{6648, 6064, 5757, 5515, 5324}, {6555, 5971, 5664, 5422, 5231}, {6463, 5890, 5589, 5351, 5164}, {6371, 5809, 5514, 5281, 5097}, {6279, 5728, 5438, 5210, 5030}}
+};
+
+static const int sbs_data_cells_table_16K[16][5][5] = {
+    {{9120, 9120, 8244, 7601, 6933}, {8992, 8992, 8129, 7495, 6835}, {8867, 8867, 8016, 7391, 6741}, {8740, 8740, 7901, 7285, 6644}, {8614, 8614, 7787, 7180, 6549}},
+    {{9120, 7807, 5841, 4290, 3063}, {8992, 7697, 5758, 4229, 3019}, {8867, 7591, 5679, 4172, 2979}, {8740, 7482, 5597, 4112, 2936}, {8614, 7374, 5517, 4053, 2894}},
+    {{10272, 10017, 9199, 8554, 8043}, {10128, 9876, 9070, 8434, 7930}, {9987, 9739, 8943, 8316, 7820}, {9844, 9599, 8815, 8197, 7708}, {9702, 9461, 8688, 8079, 7597}},
+    {{10272, 8663, 6930, 5731, 4484}, {10128, 8541, 6833, 5650, 4420}, {9987, 8422, 6738, 5572, 4360}, {9844, 8302, 6642, 5492, 4297}, {9702, 8182, 6546, 5413, 4236}},
+    {{11424, 10912, 10225, 9684, 9256}, {11264, 10759, 10082, 9549, 9126}, {11107, 10609, 9942, 9416, 8999}, {10948, 10457, 9799, 9281, 8870}, {10790, 10306, 9658, 9147, 8743}},
+    {{11424, 9708, 8288, 7168, 6282}, {11264, 9572, 8171, 7068, 6194}, {11107, 9438, 8058, 6970, 6108}, {10948, 9303, 7943, 6870, 6021}, {10790, 9169, 7828, 6771, 5934}},
+    {{12000, 11431, 10793, 10375, 9939}, {11832, 11271, 10642, 10229, 9800}, {11667, 11114, 10494, 10087, 9664}, {11500, 10955, 10344, 9942, 9525}, {11334, 10797, 10194, 9799, 9388}},
+    {{12000, 10331, 9109, 8146, 7383}, {11832, 10187, 8982, 8032, 7280}, {11667, 10045, 8857, 7920, 7179}, {11500, 9901, 8730, 7807, 7076}, {11334, 9758, 8604, 7695, 6974}},
+    {{12576, 11950, 11455, 11064, 10755}, {12400, 11783, 11294, 10909, 10604}, {12227, 11619, 11137, 10757, 10456}, {12052, 11452, 10977, 10603, 10307}, {11878, 11287, 10819, 10450, 10158}},
+    {{12576, 11011, 10010, 9221, 8596}, {12400, 10857, 9870, 9091, 8475}, {12227, 10706, 9732, 8965, 8358}, {12052, 10552, 9593, 8837, 8238}, {11878, 10400, 9455, 8710, 8120}},
+    {{12864, 12262, 11835, 11499, 11233}, {12684, 12090, 11669, 11338, 11075}, {12507, 11921, 11507, 11180, 10921}, {12328, 11751, 11342, 11020, 10765}, {12150, 11581, 11178, 10861, 10609}},
+    {{12864, 11374, 10493, 9798, 9248}, {12684, 11215, 10346, 9661, 9118}, {12507, 11058, 10202, 9526, 8992}, {12328, 10900, 10056, 9390, 8863}, {12150, 10743, 9911, 9255, 8736}},
+    {{13152, 12593, 12243, 11968, 11750}, {12968, 12416, 12072, 11800, 11585}, {12787, 12243, 11903, 11636, 11424}, {12604, 12068, 11733, 11469, 11260}, {12422, 11894, 11564, 11304, 11098}},
+    {{13152, 11834, 11113, 10544, 10094}, {12968, 11668, 10957, 10397, 9953}, {12787, 11506, 10805, 10252, 9815}, {12604, 11341, 10650, 10106, 9675}, {12422, 11178, 10497, 9960, 9536}},
+    {{13296, 12766, 12458, 12245, 12024}, {13110, 12587, 12284, 12074, 11856}, {12927, 12412, 12113, 11906, 11691}, {12742, 12234, 11940, 11735, 11523}, {12558, 12058, 11767, 11566, 11357}},
+    {{13296, 12116, 11497, 11008, 10622}, {13110, 11941, 11327, 10844, 10461}, {12927, 11780, 11178, 10703, 10328}, {12742, 11606, 11010, 10540, 10168}, {12558, 11444, 10860, 10399, 10034}}
+};
+
+static const int sbs_data_cells_table_32K[16][5][5] = {
+    {{18240, 18240, 16488, 15202, 13865}, {17984, 17984, 16256, 14988, 13669}, {17734, 17734, 16031, 14780, 13480}, {17480, 17480, 15801, 14568, 13287}, {17228, 17228, 15573, 14359, 13096}},
+    {{18240, 15612, 11678, 8576, 6121}, {17984, 15393, 11513, 8454, 6033}, {17734, 15179, 11354, 8339, 5951}, {17480, 14962, 11192, 8219, 5866}, {17228, 14746, 11031, 8101, 5782}},
+    {{0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}},
+    {{0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}},
+    {{22848, 21823, 20449, 19367, 18510}, {22528, 21517, 20163, 19095, 18250}, {22214, 21217, 19882, 18829, 17996}, {21896, 20913, 19597, 18560, 17738}, {21580, 20612, 19315, 18292, 17483}},
+    {{22848, 19412, 16570, 14329, 12555}, {22528, 19140, 16337, 14127, 12378}, {22214, 18873, 16110, 13932, 12207}, {21896, 18603, 15879, 13732, 12032}, {21580, 18335, 15651, 13534, 11859}},
+    {{24000, 22861, 21585, 20747, 19876}, {23664, 22541, 21282, 20456, 19597}, {23334, 22227, 20986, 20171, 19324}, {23000, 21909, 20685, 19882, 19048}, {22668, 21593, 20387, 19596, 18773}},
+    {{24000, 20658, 18212, 16283, 14755}, {23664, 20369, 17956, 16054, 14548}, {23334, 20085, 17707, 15831, 14347}, {23000, 19798, 17453, 15604, 14141}, {22668, 19512, 17202, 15380, 13938}},
+    {{25152, 23899, 22907, 22124, 21505}, {24800, 23564, 22586, 21815, 21204}, {24454, 23236, 22271, 21511, 20909}, {24104, 22903, 21952, 21203, 20609}, {23756, 22572, 21636, 20897, 20312}},
+    {{25152, 22016, 20010, 18429, 17177}, {24800, 21707, 19730, 18170, 16936}, {24454, 21405, 19455, 17918, 16701}, {24104, 21099, 19177, 17661, 16462}, {23756, 20794, 18900, 17407, 16225}},
+    {{25728, 24521, 23667, 22994, 22461}, {25368, 24178, 23336, 22672, 22146}, {25014, 23841, 23011, 22356, 21838}, {24656, 23500, 22681, 22036, 21525}, {24300, 23160, 22354, 21718, 21215}},
+    {{25728, 22740, 20974, 19581, 18479}, {25368, 22422, 20680, 19307, 18220}, {25014, 22109, 20392, 19038, 17967}, {24656, 21793, 20100, 18766, 17710}, {24300, 21478, 19810, 18495, 17454}},
+    {{26304, 25183, 24483, 23931, 23494}, {25936, 24830, 24140, 23596, 23165}, {25574, 24484, 23803, 23267, 22842}, {25208, 24133, 23463, 22934, 22515}, {24844, 23785, 23124, 22603, 22190}},
+    {{26304, 23658, 22211, 21070, 20167}, {25936, 23327, 21900, 20775, 19885}, {25574, 23002, 21595, 20486, 19608}, {25208, 22673, 21286, 20193, 19328}, {24844, 22345, 20979, 19902, 19049}},
+    {{26592, 25529, 24913, 24486, 24042}, {26220, 25172, 24564, 24143, 23705}, {25854, 24821, 24221, 23806, 23375}, {25484, 24465, 23875, 23466, 23040}, {25116, 24112, 23530, 23127, 22708}},
+    {{26592, 24221, 22976, 21995, 21218}, {26220, 23882, 22654, 21687, 20921}, {25854, 23549, 22339, 21385, 20630}, {25484, 23212, 22019, 21079, 20335}, {25116, 22877, 21702, 20775, 20042}}
+};
+
+double calculate_atsc3_bitrate_l1(int fft_size_enum, int guardinterval, int numpayloadsyms, int numpreamblesyms, int rate, int constellation, int framesize, int pilotpattern, int firstsbs, int cred, int pilotboost, int paprmode, int ti_mode, int fec_blocks, int l1_detail_cells, int subframe, int num_subframes, struct subframe_info_t *subframe_info_arr, int frame_length_mode, int frame_length, int excess_samples)
+{
+    int mod, plpsize;
+    int l1cells, totalcells;
+    int total_preamble_cells;
+    int first_preamble_cells;
+    int preamble_cells;
+    int data_cells;
+    int sbs_cells;
+    int sbs_data_cells;
+    int sbsnullcells;
+    int papr_cells;
+    int fec_cells;
+    double kbch, fecsize, fecrate, bitrate;
+    double TF = 0.0, T, TS, TB;
+
+    // --- Determine FEC parameters ---
+    if (framesize == FECFRAME_NORMAL) { // 64K LDPC
+        fecsize = 64800.0;
+        switch (rate) {
+            case C2_15: kbch = 8448; break;
+            case C3_15: kbch = 12768; break;
+            case C4_15: kbch = 17088; break;
+            case C5_15: kbch = 21408; break;
+            case C6_15: kbch = 25728; break;
+            case C7_15: kbch = 30048; break;
+            case C8_15: kbch = 34368; break;
+            case C9_15: kbch = 38688; break;
+            case C10_15: kbch = 43008; break;
+            case C11_15: kbch = 47328; break;
+            case C12_15: kbch = 51648; break;
+            case C13_15: kbch = 55968; break;
+            default: kbch = 0; break;
+        }
+    } else { // 16K LDPC
+        fecsize = 16200.0;
+        switch (rate) {
+            case C2_15: kbch = 1992; break;
+            case C3_15: kbch = 3072; break;
+            case C4_15: kbch = 4152; break;
+            case C5_15: kbch = 5232; break;
+            case C6_15: kbch = 6312; break;
+            case C7_15: kbch = 7392; break;
+            case C8_15: kbch = 8472; break;
+            case C9_15: kbch = 9552; break;
+            case C10_15: kbch = 10632; break;
+            case C11_15: kbch = 11712; break;
+            case C12_15: kbch = 12792; break;
+            case C13_15: kbch = 13872; break;
+            default: kbch = 0; break;
+        }
+    }
+    if (kbch == 0) return 0.0;
+
+    // --- Determine modulation ---
+    switch (constellation) {
+        case MOD_QPSK: mod = 2; break;
+        case MOD_16QAM: mod = 4; break;
+        case MOD_64QAM: mod = 6; break;
+        case MOD_256QAM: mod = 8; break;
+        case MOD_1024QAM: mod = 10; break;
+        case MOD_4096QAM: mod = 12; break;
+        default: return 0.0;
+    }
+
+    // --- Determine FEC cells ---
+    if (framesize == FECFRAME_NORMAL) {
+        switch (constellation) {
+            case MOD_QPSK: fec_cells = 32400; break;
+            case MOD_16QAM: fec_cells = 16200; break;
+            case MOD_64QAM: fec_cells = 10800; break;
+            case MOD_256QAM: fec_cells = 8100; break;
+            case MOD_1024QAM: fec_cells = 6480; break;
+            case MOD_4096QAM: fec_cells = 5400; break;
+            default: fec_cells = 0; break;
+        }
+    } else {
+        switch (constellation) {
+            case MOD_QPSK: fec_cells = 8100; break;
+            case MOD_16QAM: fec_cells = 4050; break;
+            case MOD_64QAM: fec_cells = 2700; break;
+            case MOD_256QAM: fec_cells = 2025; break;
+            default: fec_cells = 0; break;
+        }
+    }
+    if (fec_cells == 0) return 0.0;
+
+    // --- Get cell counts from tables ---
+    switch (fft_size_enum) {
+        case FFTSIZE_8K:
+            papr_cells = 72;
+            first_preamble_cells = preamble_cells_table[guardinterval >= GI_1_192 ? guardinterval : 0][4];
+            preamble_cells = preamble_cells_table[guardinterval >= GI_1_192 ? guardinterval : 0][cred];
+            data_cells = data_cells_table_8K[pilotpattern][cred];
+            sbs_cells = sbs_cells_table_8K[pilotpattern][cred];
+            sbs_data_cells = sbs_data_cells_table_8K[pilotpattern][cred][pilotboost];
+            break;
+        case FFTSIZE_16K:
+            papr_cells = 144;
+            first_preamble_cells = preamble_cells_table[guardinterval >= GI_1_192 ? guardinterval + 6 : 7][4];
+            preamble_cells = preamble_cells_table[guardinterval >= GI_1_192 ? guardinterval + 6 : 7][cred];
+            data_cells = data_cells_table_16K[pilotpattern][cred];
+            sbs_cells = sbs_cells_table_16K[pilotpattern][cred];
+            sbs_data_cells = sbs_data_cells_table_16K[pilotpattern][cred][pilotboost];
+            break;
+        case FFTSIZE_32K:
+            papr_cells = 288;
+            // Special handling for 32K preamble table indices
+            if (guardinterval == GI_9_3072) {
+                if (pilotpattern == 6 || pilotpattern == 7) { // PILOT_SP8_2 or PILOT_SP8_4
+                    first_preamble_cells = preamble_cells_table[26][4];
+                    preamble_cells = preamble_cells_table[26][cred];
+                } else {
+                    first_preamble_cells = preamble_cells_table[27][4];
+                    preamble_cells = preamble_cells_table[27][cred];
+                }
+            } else if (guardinterval == GI_10_3648) {
+                if (pilotpattern == 6 || pilotpattern == 7) {
+                    first_preamble_cells = preamble_cells_table[28][4];
+                    preamble_cells = preamble_cells_table[28][cred];
+                } else {
+                    first_preamble_cells = preamble_cells_table[29][4];
+                    preamble_cells = preamble_cells_table[29][cred];
+                }
+            } else {
+                int idx = 18;
+                if (guardinterval >= GI_1_192) idx = guardinterval + 17;
+                first_preamble_cells = preamble_cells_table[idx][4];
+                preamble_cells = preamble_cells_table[idx][cred];
+            }
+            data_cells = data_cells_table_32K[pilotpattern][cred];
+            sbs_cells = sbs_cells_table_32K[pilotpattern][cred];
+            sbs_data_cells = sbs_data_cells_table_32K[pilotpattern][cred][pilotboost];
+            break;
+        default:
+            return 0.0;
+    }
+
+    // --- Calculate L1 cells ---
+    l1cells = l1_detail_cells;
+    // Add L1-Basic cells (simplified - using mode 3 as default)
+    l1cells += 484;
+
+    // --- Apply PAPR ---
+    if (paprmode != 1) {
+        papr_cells = 0;
+    }
+
+    // --- Calculate Frame Time (TF) ---
+    T = 1.0 / (384000.0 * 18.0);
+    TB = 1.0 / 6144000.0;
+
+    if (frame_length_mode == 0) { // Time-aligned
+        TF = frame_length * 5.0;
+    } else { // Symbol-aligned
+        for (int n = 0; n < num_subframes; n++) {
+            int current_fft_size_enum = (n == 0) ? subframe_info_arr[0].fft_size : subframe_info_arr[n].fft_size;
+            int current_gi_enum = (n == 0) ? subframe_info_arr[0].guard_interval : subframe_info_arr[n].guard_interval;
+            int current_fft_val = (current_fft_size_enum == FFTSIZE_8K) ? 8192 : ((current_fft_size_enum == FFTSIZE_16K) ? 16384 : 32768);
+            
+            int guard_interval_val = 0;
+            switch(current_gi_enum) {
+                case GI_1_192: guard_interval_val = 192; break;
+                case GI_2_384: guard_interval_val = 384; break;
+                case GI_3_512: guard_interval_val = 512; break;
+                case GI_4_768: guard_interval_val = 768; break;
+                case GI_5_1024: guard_interval_val = 1024; break;
+                case GI_6_1536: guard_interval_val = 1536; break;
+                case GI_7_2048: guard_interval_val = 2048; break;
+                case GI_8_2432: guard_interval_val = 2432; break;
+                case GI_9_3072: guard_interval_val = 3072; break;
+                case GI_10_3648: guard_interval_val = 3648; break;
+                case GI_11_4096: guard_interval_val = 4096; break;
+                case GI_12_4864: guard_interval_val = 4864; break;
+            }
+
+            int symbols = (n == 0) ? subframe_info_arr[n].num_ofdm_symbols + subframe_info_arr[n].num_preamble_symbols : subframe_info_arr[n].num_ofdm_symbols;
+            TS = (T * (current_fft_val + guard_interval_val)) * 1000.0;
+            TF += (symbols * TS);
+            if (n == 0) {
+                TF += (3072.0 * 4 * TB * 1000.0);
+            }
+        }
+    }
+
+    if (TF == 0.0) return 0.0;
+
+    // --- Calculate total cells ---
+    total_preamble_cells = 0;
+    for (int n = 1; n < numpreamblesyms; n++) {
+        total_preamble_cells += preamble_cells - papr_cells;
+    }
+    
+    if (numpreamblesyms == 0) {
+        first_preamble_cells = 0;
+        l1cells = 0;
+    }
+    
+    if (firstsbs) {
+        totalcells = first_preamble_cells + total_preamble_cells + ((numpayloadsyms - 2) * (data_cells - papr_cells)) + ((sbs_cells - papr_cells) * 2);
+    } else {
+        totalcells = first_preamble_cells + total_preamble_cells + ((numpayloadsyms - 1) * (data_cells - papr_cells)) + (sbs_cells - papr_cells);
+    }
+    
+    sbsnullcells = sbs_cells - sbs_data_cells;
+    if (firstsbs) {
+        plpsize = totalcells - l1cells - (sbsnullcells * 2);
+    } else {
+        plpsize = totalcells - l1cells - sbsnullcells;
+    }
+    
+    // Override plpsize for HTI mode
+    if (ti_mode == 2) {
+        plpsize = fec_blocks * fec_cells;
+    }
+    
+    fecrate = kbch / fecsize;
+    bitrate = (1000.0 / TF) * (plpsize * mod * fecrate);
+
+    return bitrate;
+}
+
 // Base64 decoding tables
 static int b64invs[] = { 62, -1, -1, -1, 63, 52, 53, 54, 55, 56, 57, 58,
     59, 60, 61, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5,
@@ -289,112 +718,6 @@ static int get_bits(int count) {
     return value;
 }
 
-/*
- * calculate_atsc3_bitrate_l1
- * Calculates the bitrate for a given PLP based on L1 signaling parameters.
- * Adapted from atsc3rate() in l1dump.c
- */
-double calculate_atsc3_bitrate_l1(int fft_size_enum, int guardinterval, int numpayloadsyms, int numpreamblesyms, int rate, int constellation, int framesize, int pilotpattern, int firstsbs, int cred, int pilotboost, int paprmode, int ti_mode, int fec_blocks, int l1_detail_cells, int subframe, int num_subframes, struct subframe_info_t *subframe_info_arr, int frame_length_mode, int frame_length, int excess_samples, long plp_size_cells)
-{
-    int mod;
-    double kbch, fecsize, fecrate, bitrate;
-    double TF = 0.0, T, TS, TB;
-
-    // --- Determine FEC parameters ---
-    if (framesize == FECFRAME_NORMAL) { // 64K LDPC
-        fecsize = 64800.0;
-        switch (rate) {
-            case C2_15: kbch = 8448; break;
-            case C3_15: kbch = 12768; break;
-            case C4_15: kbch = 17088; break;
-            case C5_15: kbch = 21408; break;
-            case C6_15: kbch = 25728; break;
-            case C7_15: kbch = 30048; break;
-            case C8_15: kbch = 34368; break;
-            case C9_15: kbch = 38688; break;
-            case C10_15: kbch = 43008; break;
-            case C11_15: kbch = 47328; break;
-            case C12_15: kbch = 51648; break;
-            case C13_15: kbch = 55968; break;
-            default: kbch = 0; break;
-        }
-    } else { // 16K LDPC
-        fecsize = 16200.0;
-        switch (rate) {
-            case C2_15: kbch = 1992; break;
-            case C3_15: kbch = 3072; break;
-            case C4_15: kbch = 4152; break;
-            case C5_15: kbch = 5232; break;
-            case C6_15: kbch = 6312; break;
-            case C7_15: kbch = 7392; break;
-            case C8_15: kbch = 8472; break;
-            case C9_15: kbch = 9552; break;
-            case C10_15: kbch = 10632; break;
-            case C11_15: kbch = 11712; break;
-            case C12_15: kbch = 12792; break;
-            case C13_15: kbch = 13872; break;
-            default: kbch = 0; break;
-        }
-    }
-    if (kbch == 0) return 0.0;
-
-    // --- Determine modulation ---
-    switch (constellation) {
-        case MOD_QPSK: mod = 2; break;
-        case MOD_16QAM: mod = 4; break;
-        case MOD_64QAM: mod = 6; break;
-        case MOD_256QAM: mod = 8; break;
-        case MOD_1024QAM: mod = 10; break;
-        case MOD_4096QAM: mod = 12; break;
-        default: return 0.0;
-    }
-
-    // --- Calculate Frame Time (TF) ---
-    T = 1.0 / (384000.0 * 18.0);
-    TB = 1.0 / 6144000.0;
-
-    if (frame_length_mode == 0) { // Time-aligned
-        TF = frame_length * 5.0;
-    } else { // Symbol-aligned
-        for (int n = 0; n < num_subframes; n++) {
-            int current_fft_size_enum = (n == 0) ? subframe_info_arr[0].fft_size : subframe_info_arr[n].fft_size;
-            int current_gi_enum = (n == 0) ? subframe_info_arr[0].guard_interval : subframe_info_arr[n].guard_interval;
-            int current_fft_val = (current_fft_size_enum == FFTSIZE_8K) ? 8192 : ((current_fft_size_enum == FFTSIZE_16K) ? 16384 : 32768);
-            
-            int guard_interval_val = 0;
-            switch(current_gi_enum) {
-                case GI_1_192: guard_interval_val = 192; break;
-                case GI_2_384: guard_interval_val = 384; break;
-                case GI_3_512: guard_interval_val = 512; break;
-                case GI_4_768: guard_interval_val = 768; break;
-                case GI_5_1024: guard_interval_val = 1024; break;
-                case GI_6_1536: guard_interval_val = 1536; break;
-                case GI_7_2048: guard_interval_val = 2048; break;
-                case GI_8_2432: guard_interval_val = 2432; break;
-                case GI_9_3072: guard_interval_val = 3072; break;
-                case GI_10_3648: guard_interval_val = 3648; break;
-                case GI_11_4096: guard_interval_val = 4096; break;
-                case GI_12_4864: guard_interval_val = 4864; break;
-            }
-
-            int symbols = (n == 0) ? subframe_info_arr[n].num_ofdm_symbols + subframe_info_arr[n].num_preamble_symbols : subframe_info_arr[n].num_ofdm_symbols;
-            TS = (T * (current_fft_val + guard_interval_val)) * 1000.0;
-            TF += (symbols * TS);
-            if (n == 0) {
-                TF += (3072.0 * 4 * TB * 1000.0);
-            }
-        }
-    }
-
-    if (TF == 0.0) return 0.0;
-
-    fecrate = kbch / fecsize;
-    bitrate = (1000.0 / TF) * (plp_size_cells * mod * fecrate);
-
-    return bitrate;
-} 
-
-
 void parse_l1_data_l1(const unsigned char* data, size_t len, char** display_lines, int* line_count, int max_lines, struct l1_parse_context* context) {
     long value;
     int i, j, k;
@@ -414,7 +737,12 @@ void parse_l1_data_l1(const unsigned char* data, size_t len, char** display_line
 
     // Structs for bitrate calculation
     struct subframe_info_t subframe_info[257] = {0};
-    struct plp_info_t plp_info[MAX_PLPS] = {0};
+    int plp_count = 0;
+    struct plp_info_t plp_info[MAX_PLPS];
+    for (int idx = 0; idx < MAX_PLPS; idx++) {
+        plp_info[idx].plp_id = -1;  // Mark as unused
+        plp_info[idx].subframe_index = -1;
+    }
     
     struct l1_detail_info info_temp = {display_lines, *line_count, max_lines, *context};
     
@@ -561,13 +889,16 @@ void parse_l1_data_l1(const unsigned char* data, size_t len, char** display_line
         // Parse PLPs for this subframe
         for (j = 0; j <= l1d_num_plp; j++) {
             add_line(&info_temp, "    PLP #%d:", j);
-            value = get_bits(6); add_line(&info_temp, "      L1D_plp_id: %ld", value); plp_info[j].plp_id = value;
+            int global_plp_idx = plp_count;
+            plp_info[global_plp_idx].subframe_index = i;
+            value = get_bits(6); add_line(&info_temp, "      L1D_plp_id: %ld", value); plp_info[global_plp_idx].plp_id = value;
+            plp_info[global_plp_idx].subframe_index = i;
             value = get_bits(1); add_line(&info_temp, "      L1D_plp_lls_flag: %ld", value);
             value = get_bits(2); add_line(&info_temp, "      L1D_plp_layer: %s", (value==0) ? "Core" : (value==1 ? "Enhanced" : "Reserved")); l1d_plp_layer = value;
             value = get_bits(24); add_line(&info_temp, "      L1D_plp_start: %ld", value);
-            value = get_bits(24); add_line(&info_temp, "      L1D_plp_size: %ld", value); plp_info[j].size = value;
+            value = get_bits(24); add_line(&info_temp, "      L1D_plp_size: %ld", value); plp_info[global_plp_idx].size = value;
             value = get_bits(2); add_line(&info_temp, "      L1D_plp_scrambler_type: %s", (value==0) ? "PRBS" : "Reserved");
-            value = get_bits(4); plp_info[j].fec_type = !(value & 1);
+            value = get_bits(4); plp_info[global_plp_idx].fec_type = !(value & 1);
             switch (value) {
                 case 0: add_line(&info_temp, "      L1D_plp_fec_type: BCH + 16K LDPC"); break;
                 case 1: add_line(&info_temp, "      L1D_plp_fec_type: BCH + 64K LDPC"); break;
@@ -586,7 +917,7 @@ void parse_l1_data_l1(const unsigned char* data, size_t len, char** display_line
                 }
             }
             if (value <= 5) {
-                value = get_bits(4); l1d_plp_mod = value; plp_info[j].mod = value;
+                value = get_bits(4); l1d_plp_mod = value; plp_info[global_plp_idx].mod = value;
                 switch (value) {
                     case MOD_QPSK: add_line(&info_temp, "      L1D_plp_mod: QPSK"); break;
                     case MOD_16QAM: add_line(&info_temp, "      L1D_plp_mod: 16QAM"); break;
@@ -596,7 +927,7 @@ void parse_l1_data_l1(const unsigned char* data, size_t len, char** display_line
                     case MOD_4096QAM: add_line(&info_temp, "      L1D_plp_mod: 4096QAM"); break;
                     default: add_line(&info_temp, "      L1D_plp_mod: Reserved"); break;
                 }
-                value = get_bits(4); plp_info[j].cod = value;
+                value = get_bits(4); plp_info[global_plp_idx].cod = value;
                 switch (value) {
                     case C2_15: add_line(&info_temp, "      L1D_plp_cod: 2/15"); break;
                     case C3_15: add_line(&info_temp, "      L1D_plp_cod: 3/15"); break;
@@ -613,7 +944,7 @@ void parse_l1_data_l1(const unsigned char* data, size_t len, char** display_line
                     default: add_line(&info_temp, "      L1D_plp_cod: Reserved"); break;
                 }
             }
-            value = get_bits(2); l1d_plp_TI_mode = value; plp_info[j].ti_mode = value;
+            value = get_bits(2); l1d_plp_TI_mode = value; plp_info[global_plp_idx].ti_mode = value;
             switch (value) {
                 case 0: add_line(&info_temp, "      L1D_plp_TI_mode: No TI"); break;
                 case 1: add_line(&info_temp, "      L1D_plp_TI_mode: CTI"); break;
@@ -660,7 +991,7 @@ void parse_l1_data_l1(const unsigned char* data, size_t len, char** display_line
                     value = get_bits(4); add_line(&info_temp, "      L1D_plp_HTI_num_ti_blocks: %ld", value + 1); l1d_plp_HTI_num_ti_blocks = value;
                     value = get_bits(12); add_line(&info_temp, "      L1D_plp_HTI_num_fec_blocks_max: %ld", value + 1);
                     if (l1d_plp_HTI_inter_subframe == 0) {
-                        value = get_bits(12); add_line(&info_temp, "      L1D_plp_HTI_num_fec_blocks: %ld", value + 1); plp_info[j].HTI_num_fec_blocks = value + 1;
+                        value = get_bits(12); add_line(&info_temp, "      L1D_plp_HTI_num_fec_blocks: %ld", value + 1); plp_info[global_plp_idx].HTI_num_fec_blocks = value + 1;
                     } else {
                         for (k = 0; k <= l1d_plp_HTI_num_ti_blocks; k++) {
                             value = get_bits(12); add_line(&info_temp, "        L1D_plp_HTI_num_fec_blocks: %ld", value + 1);
@@ -671,23 +1002,12 @@ void parse_l1_data_l1(const unsigned char* data, size_t len, char** display_line
             } else {
                 value = get_bits(5); add_line(&info_temp, "      L1D_plp_ldm_injection_level: %ld", value);
             }
-            
-            // Calculate and add bitrate info
-            double bitrate = calculate_atsc3_bitrate_l1(
-                subframe_info[i].fft_size, subframe_info[i].guard_interval, subframe_info[i].num_ofdm_symbols,
-                (i==0 ? subframe_info[0].num_preamble_symbols : 0),
-                plp_info[j].cod, plp_info[j].mod, plp_info[j].fec_type,
-                subframe_info[i].scattered_pilot_pattern, subframe_info[i].sbs_first,
-                subframe_info[i].reduced_carriers, subframe_info[i].scattered_pilot_boost,
-                l1b_papr_reduction, plp_info[j].ti_mode, plp_info[j].HTI_num_fec_blocks,
-                l1b_l1_detail_total_cells, i, l1b_num_subframes + 1, subframe_info,
-                l1b_frame_length_mode, l1b_frame_length, l1b_excess_samples_per_symbol, plp_info[j].size
-            );
-            if (bitrate > 0) {
-                add_line(&info_temp, "      -> PLP Bitrate: %.3f Mbps", bitrate / 1000000.0);
-            }
+            add_line(&info_temp, "      __BITRATE_PLACEHOLDER__");
+            plp_count++;
         }
     }
+    
+    add_line(&info_temp, " ");  // Add blank line
     
     // Handle remaining L1D fields
     if (l1d_version >= 1) {
@@ -716,6 +1036,41 @@ void parse_l1_data_l1(const unsigned char* data, size_t len, char** display_line
         get_bits(((l1b_l1_detail_size_bytes * 8) - 32) - (bits_index - 200));
     }
     value = get_bits(32); add_line(&info_temp, "L1D_crc: 0x%08lx", value);
+    
+    // Calculate bitrates for all PLPs and replace placeholders
+    for (int plp_idx = 0; plp_idx < plp_count; plp_idx++) {
+        int i = plp_info[plp_idx].subframe_index;
+        int actual_sbs_first = (i == 0) ? l1b_first_sub_sbs_first : subframe_info[i].sbs_first;
+        
+        double bitrate = calculate_atsc3_bitrate_l1(
+            subframe_info[i].fft_size, subframe_info[i].guard_interval, subframe_info[i].num_ofdm_symbols,
+            (i==0 ? subframe_info[0].num_preamble_symbols : 0),
+            plp_info[plp_idx].cod, plp_info[plp_idx].mod, plp_info[plp_idx].fec_type,
+            subframe_info[i].scattered_pilot_pattern, actual_sbs_first,
+            subframe_info[i].reduced_carriers, subframe_info[i].scattered_pilot_boost,
+            l1b_papr_reduction, plp_info[plp_idx].ti_mode, plp_info[plp_idx].HTI_num_fec_blocks,
+            l1b_l1_detail_total_cells, i, l1b_num_subframes + 1, subframe_info,
+            l1b_frame_length_mode, l1b_frame_length, l1b_excess_samples_per_symbol
+        );
+        
+        // Find and replace the placeholder
+        for (int line_idx = 0; line_idx < info_temp.line_count; line_idx++) {
+            if (strstr(info_temp.display_lines[line_idx], "__BITRATE_PLACEHOLDER__")) {
+                free(info_temp.display_lines[line_idx]);
+                
+                if (bitrate > 0) {
+                    char bitrate_line[128];
+                    snprintf(bitrate_line, sizeof(bitrate_line), "      -> PLP Bitrate: %.3f Mbps", 
+                            bitrate / 1000000.0);
+                    info_temp.display_lines[line_idx] = strdup(bitrate_line);
+                } else {
+                    // If bitrate calculation failed, just remove the placeholder
+                    info_temp.display_lines[line_idx] = strdup(" ");
+                }
+                break;  // Found and replaced this placeholder, move to next PLP
+            }
+        }
+    }
     
     // Update context and line count
     *context = info_temp.context;
@@ -845,12 +1200,105 @@ int collect_atsc3_details(struct hdhomerun_device_t *hd, int tuner_index, struct
         detail_info->display_lines[detail_info->line_count++] = strdup(" ");
     }
 
-    // Process PLP info
+    // NEW: Create a map of PLP ID to LDPC length by parsing L1 detail first
+    #define MAX_PLP_MAP 64
+    struct plp_ldpc_map {
+        int plp_id;
+        int ldpc_length; // 0=16K, 1=64K, -1=unknown
+    } plp_ldpc_map[MAX_PLP_MAP];
+    int plp_map_count = 0;
+    
+    // Initialize map
+    for (int i = 0; i < MAX_PLP_MAP; i++) {
+        plp_ldpc_map[i].plp_id = -1;
+        plp_ldpc_map[i].ldpc_length = -1;
+    }
+    
+    char *raw_status_str;
+    struct hdhomerun_tuner_status_t status;
+    bool has_db_values = false;
+    if (hdhomerun_device_get_tuner_status(hd, &raw_status_str, &status) > 0) {
+        if (parse_status_value_l1(raw_status_str, "ss=") != -999) has_db_values = true;
+    }
+
+    char *fresh_version_str;
+    long version_num = 0;
+    if (hdhomerun_device_get_var(hd, "/sys/version", &fresh_version_str, NULL) > 0) {
+        char numeric_version_str[16] = {0};
+        int i = 0;
+        while(fresh_version_str[i] && isdigit((unsigned char)fresh_version_str[i]) && i < 15) {
+            numeric_version_str[i] = fresh_version_str[i];
+            i++;
+        }
+        version_num = atol(numeric_version_str);
+    }
+    
+    // Parse L1 detail to build PLP->LDPC map
+    if (has_db_values && version_num > 20250623) {
+        char l1_path[64];
+        sprintf(l1_path, "/tuner%d/l1detail", tuner_index);
+
+        char *l1_detail_str;
+        if (hdhomerun_device_get_var(hd, l1_path, &l1_detail_str, NULL) > 0) {
+            size_t decoded_len = b64_decoded_size_l1(l1_detail_str);
+            unsigned char *decoded_data = malloc(decoded_len);
+            if (decoded_data) {
+                if (b64_decode_l1(l1_detail_str, decoded_data, decoded_len)) {
+                    // Parse to extract PLP IDs and their FEC types
+                    char** temp_lines = malloc(MAX_DISPLAY_LINES * sizeof(char*));
+                    int temp_line_count = 0;
+                    struct l1_parse_context temp_context = {false, -1};
+                    
+                    if (temp_lines) {
+                        parse_l1_data_l1(decoded_data, decoded_len, temp_lines, 
+                                        &temp_line_count, MAX_DISPLAY_LINES, &temp_context);
+                        
+                        // Scan through parsed lines to build the map
+                        int current_plp_id = -1;
+                        for (int j = 0; j < temp_line_count && plp_map_count < MAX_PLP_MAP; j++) {
+                            // Look for PLP ID lines
+                            if (strstr(temp_lines[j], "L1D_plp_id:")) {
+                                sscanf(temp_lines[j], "%*[^:]: %d", &current_plp_id);
+                            }
+                            // Look for FEC type lines
+                            else if (strstr(temp_lines[j], "L1D_plp_fec_type:") && current_plp_id >= 0) {
+                                int ldpc_len = -1;
+                                if (strstr(temp_lines[j], "16K")) {
+                                    ldpc_len = 0; // Short
+                                } else if (strstr(temp_lines[j], "64K")) {
+                                    ldpc_len = 1; // Long
+                                }
+                                
+                                // Add to map
+                                plp_ldpc_map[plp_map_count].plp_id = current_plp_id;
+                                plp_ldpc_map[plp_map_count].ldpc_length = ldpc_len;
+                                plp_map_count++;
+                                current_plp_id = -1; // Reset for next PLP
+                            }
+                        }
+                        
+                        // Free temporary lines
+                        for (int j = 0; j < temp_line_count; j++) {
+                            free(temp_lines[j]);
+                        }
+                        free(temp_lines);
+                    }
+                }
+                free(decoded_data);
+            }
+        }
+    }
+
+    // Process PLP info using the LDPC map
     if (plpinfo_copy) {
         char *line = strtok(plpinfo_copy, "\n");
         while (line != NULL && detail_info->line_count < detail_info->max_lines) {
             if (strncmp(line, "bsid=", 5) != 0) {
                 detail_info->display_lines[detail_info->line_count++] = strdup(line);
+                
+                // Extract PLP ID from this line
+                int line_plp_id = -1;
+                sscanf(line, "%d:", &line_plp_id);
                 
                 char *mod_ptr = strstr(line, "mod=");
                 char *cod_ptr = strstr(line, "cod=");
@@ -875,13 +1323,21 @@ int collect_atsc3_details(struct hdhomerun_device_t *hd, int tuner_index, struct
                         cod_str[cod_len] = '\0';
                     }
                     
-                    int ldpc_length = -1;  // Unknown by default
+                    // Look up LDPC length for this PLP ID
+                    int ldpc_length = -1;
+                    for (int i = 0; i < plp_map_count; i++) {
+                        if (plp_ldpc_map[i].plp_id == line_plp_id) {
+                            ldpc_length = plp_ldpc_map[i].ldpc_length;
+                            break;
+                        }
+                    }
+                    
                     struct snr_pair_result snr_result = get_snr_pair_for_modcod_l1(normalized_mod_str, cod_str, ldpc_length);
                     if (snr_result.found) {
                         char snr_line[256] = {0};
                         if (snr_result.ldpc_length_known) {
-                            sprintf(snr_line, "  -> Required SNR: AWGN %.2f dB, Rayleigh %.2f dB (%s)", 
-                                    snr_result.awgn_min, snr_result.rayleigh_min, snr_result.description);
+                            sprintf(snr_line, "  -> Required SNR: AWGN %.2f dB, Rayleigh %.2f dB", 
+                                    snr_result.awgn_min, snr_result.rayleigh_min);
                         } else {
                             sprintf(snr_line, "  -> Required SNR: AWGN %.2f to %.2f dB, Rayleigh %.2f to %.2f dB", 
                             snr_result.awgn_min, snr_result.awgn_max, 
@@ -899,33 +1355,13 @@ int collect_atsc3_details(struct hdhomerun_device_t *hd, int tuner_index, struct
         }
     }
 
-    // Add L1 Detail if available
-    char *raw_status_str;
-    struct hdhomerun_tuner_status_t status;
-    bool has_db_values = false;
-    if (hdhomerun_device_get_tuner_status(hd, &raw_status_str, &status) > 0) {
-        if (parse_status_value_l1(raw_status_str, "ss=") != -999) has_db_values = true;
-    }
-
-    char *fresh_version_str;
-    long version_num = 0;
-    if (hdhomerun_device_get_var(hd, "/sys/version", &fresh_version_str, NULL) > 0) {
-        char numeric_version_str[16] = {0};
-        int i = 0;
-        while(fresh_version_str[i] && isdigit((unsigned char)fresh_version_str[i]) && i < 15) {
-            numeric_version_str[i] = fresh_version_str[i];
-            i++;
-        }
-        version_num = atol(numeric_version_str);
-    }
-    
+    // Add L1 Detail if available (rest remains the same)
     if (has_db_values && version_num > 20250623) {
         char l1_path[64];
         sprintf(l1_path, "/tuner%d/l1detail", tuner_index);
 
         char *l1_detail_str;
         if (hdhomerun_device_get_var(hd, l1_path, &l1_detail_str, NULL) > 0) {
-            // Add separator before L1 detail info
             if (detail_info->line_count < detail_info->max_lines - 3) {
                 detail_info->display_lines[detail_info->line_count++] = strdup("__HLINE__");
                 detail_info->display_lines[detail_info->line_count++] = strdup(" ");
@@ -938,7 +1374,6 @@ int collect_atsc3_details(struct hdhomerun_device_t *hd, int tuner_index, struct
                     parse_l1_data_l1(decoded_data, decoded_len, detail_info->display_lines, 
                                     &detail_info->line_count, detail_info->max_lines, &detail_info->context);
                     
-                    // Update SNR info with LDPC-aware values
                     if (detail_info->context.ldpc_info_available) {
                         update_plp_snr_info_l1(detail_info->display_lines, detail_info->line_count, 
                                               detail_info->context.ldpc_length);

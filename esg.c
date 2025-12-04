@@ -48,6 +48,7 @@ EsgFragmentData* parse_esg_service_fragment(xmlDocPtr doc) {
     if (!esg_data) return NULL;
 
     xmlNodePtr root = xmlDocGetRootElement(doc);
+    printf("DEBUG: ESG parsing root element: %s\n", root->name);
 
     if (xmlStrcmp(root->name, (const xmlChar *)"Service") == 0) {
         parse_esg_service(root, esg_data);
@@ -59,6 +60,15 @@ EsgFragmentData* parse_esg_service_fragment(xmlDocPtr doc) {
         parse_esg_service_bundle(root, esg_data);
     } else if (xmlStrcmp(root->name, (const xmlChar *)"Content") == 0) {
         parse_esg_content(root, esg_data);
+    }
+
+    printf("DEBUG ESG PARSED: Services=%p, Programs=%p\n", 
+        (void*)esg_data->services, (void*)esg_data->programs);
+    if (esg_data->services) {
+        printf("  First service: name='%s'\n", esg_data->services->name);
+    }
+    if (esg_data->programs) {
+        printf("  First program: title='%s'\n", esg_data->programs->title);
     }
     
     return esg_data;
@@ -337,6 +347,8 @@ void parse_esg_content(xmlNodePtr content_node, EsgFragmentData* esg_data) {
     // Add to program list
     program->next = esg_data->programs;
     esg_data->programs = program;
+    
+    printf("DEBUG ESG CONTENT: Created program '%s' (id=%s)\n", program->title, program->id);
 }
 
 EsgContentRating* parse_esg_content_rating(xmlNodePtr rating_node) {
@@ -585,6 +597,7 @@ SgddData* parse_sgdd(xmlDocPtr doc) {
  */
 void correlate_esg_fragments(const char* destIp, const char* destPort, 
                              void* lls_tables_ptr, int lls_table_count) {
+    printf("\n=== Correlating ESG fragments for %s:%s ===\n", destIp, destPort);
     
     LlsTable* lls_tables = (LlsTable*)lls_tables_ptr;
     
@@ -627,6 +640,7 @@ void correlate_esg_fragments(const char* destIp, const char* destPort,
                 memcpy(new_svc, svc, sizeof(EsgServiceInfo));
                 new_svc->next = all_services;
                 all_services = new_svc;
+                printf("  Added service: %s - %s\n", new_svc->id, new_svc->name);
             }
             
             svc = svc->next;
@@ -657,6 +671,7 @@ void correlate_esg_fragments(const char* destIp, const char* destPort,
                 memcpy(new_prog, prog, sizeof(EsgProgramInfo));
                 new_prog->next = all_programs;
                 all_programs = new_prog;
+                printf("  Added program: %s - %s\n", new_prog->id, new_prog->title);
             }
             
             prog = prog->next;
@@ -680,6 +695,8 @@ void correlate_esg_fragments(const char* destIp, const char* destPort,
                 EsgProgramInfo* prog = all_programs;
                 while (prog) {
                     if (strcmp(prog->id, event->programId) == 0) {
+                        printf("  Linked schedule event at %s to program '%s'\n", 
+                               event->startTime, prog->title);
                         break;
                     }
                     prog = prog->next;
@@ -690,6 +707,8 @@ void correlate_esg_fragments(const char* destIp, const char* destPort,
         }
     }
     
+    printf("=== ESG Correlation complete: %d unique services, %d unique programs ===\n",
+           count_services(all_services), count_programs(all_programs));
 }
 
 int count_services(EsgServiceInfo* head) {

@@ -1,4 +1,4 @@
-RENDER - RabbitEars NextGen Data Evaluator Report - v0.1
+RENDER - RabbitEars NextGen Data Evaluator and Reporter - v0.2
 
 RENDER is software written using Google Gemini and Anthropic Claude to parse
 ATSC 3.0 signals and output them in an HTML format, similar to the TSReader
@@ -10,6 +10,13 @@ Many thanks to drmpeg; his l1detail parsing code has been adapted for use in
 RENDER.  It, like RENDER, is licensed in GPLv3.
 
 https://github.com/drmpeg/dtv-utils/tree/master
+
+It also uses code from:
+
+- FFMPEG/libavcodec
+  + Licensed under the LGPL 2.1
+- This AC-4 patch:  https://github.com/funnymanva/ffmpeg-with-ac4
+  + Licensed under the MIT license
 
 The software supports the following input formats:
 
