@@ -1,0 +1,114 @@
+ 
+Firmware Version: 20250815
+ 
+L1D BSID: 1408 (0x580)
+SLT TSID: 1408 (0x580)
+ 
+0: sfi=0 mod=qpsk cod=9/15 layer=core ti=cti lls=1 lock=1
+  -> Required SNR: AWGN 1.97 to 2.20 dB, Rayleigh 4.35 to 4.70 dB
+ 
+1: sfi=0 mod=qam256 cod=7/15 layer=enhanced ti=cti lls=1 lock=1
+  -> Required SNR: AWGN 12.10 to 12.57 dB, Rayleigh 14.58 to 15.15 dB
+ 
+16: sfi=0 mod=qpsk cod=2/15 layer=core ti=cti lls=0
+  -> Required SNR: AWGN -6.23 to -5.55 dB, Rayleigh -5.72 to -5.06 dB
+ 
+================================================================================
+ 
+--- L1-Basic Signaling ---
+L1B_version: 0
+L1B_mimo_scattered_pilot_encoding: Walsh-Hadamard
+L1B_lls_flag: No LLS
+L1B_time_info_flag: ns precision
+L1B_return_channel_flag: 0
+L1B_papr_reduction: None
+L1B_frame_length_mode: Symbol-aligned
+  L1B_time_offset: 18496
+  L1B_additional_samples: 0
+L1B_num_subframes: 1
+L1B_preamble_num_symbols: 2
+L1B_preamble_reduced_carriers: 3
+L1B_L1_Detail_content_tag: 1
+L1B_L1_Detail_size_bytes: 58
+L1B_L1_Detail_fec_type: Mode 1
+L1B_L1_additional_parity_mode: K=0
+L1B_L1_Detail_total_cells: 4387
+L1B_first_sub_mimo: No MIMO
+L1B_first_sub_miso: 0
+L1B_first_sub_fft_size: 8K
+L1B_first_sub_reduced_carriers: 3
+L1B_first_sub_guard_interval: GI_3_512
+L1B_first_sub_num_ofdm_symbols: 189
+L1B_first_sub_scattered_pilot_pattern: 9
+L1B_first_sub_scattered_pilot_boost: 1
+L1B_first_sub_sbs_first: 1
+L1B_first_sub_sbs_last: 1
+L1B_crc: 0x00000000
+ 
+--- L1-Detail Signaling ---
+L1D_version: 1
+L1D_num_rf: 0
+L1D_time_sec: 1760172088
+L1D_time_msec: 931
+L1D_time_usec: 380
+L1D_time_nsec: 873
+ 
+Subframe #0:
+  L1D_frequency_interleaver: All Symbols
+  L1D_sbs_null_cells: 747
+  L1D_num_plp: 3
+    PLP #0:
+      L1D_plp_id: 0
+      L1D_plp_lls_flag: 1
+      L1D_plp_layer: Core
+      L1D_plp_start: 0
+      L1D_plp_size: 1133282
+      L1D_plp_scrambler_type: PRBS
+      L1D_plp_fec_type: BCH + 64K LDPC
+      L1D_plp_mod: QPSK
+      L1D_plp_cod: 9/15
+      L1D_plp_TI_mode: CTI
+      L1D_plp_CTI_fec_block_start: 852798
+      L1D_plp_type: non-dispersed
+      L1D_plp_TI_extended_interleaving: 0
+      L1D_plp_CTI_depth: 3
+      L1D_plp_CTI_start_row: 2
+      -> PLP Bitrate: 5.580 Mbps
+    PLP #1:
+      L1D_plp_id: 1
+      L1D_plp_lls_flag: 1
+      L1D_plp_layer: Enhanced
+      L1D_plp_start: 0
+      L1D_plp_size: 1133282
+      L1D_plp_scrambler_type: PRBS
+      L1D_plp_fec_type: BCH + 64K LDPC
+      L1D_plp_mod: 256QAM
+      L1D_plp_cod: 7/15
+      L1D_plp_TI_mode: CTI
+      L1D_plp_CTI_fec_block_start: 852798
+      L1D_plp_ldm_injection_level: 10
+      -> PLP Bitrate: 17.335 Mbps
+    PLP #2:
+      L1D_plp_id: 16
+      L1D_plp_lls_flag: 0
+      L1D_plp_layer: Core
+      L1D_plp_start: 1133282
+      L1D_plp_size: 32400
+      L1D_plp_scrambler_type: PRBS
+      L1D_plp_fec_type: BCH + 16K LDPC
+      L1D_plp_mod: QPSK
+      L1D_plp_cod: 2/15
+      L1D_plp_TI_mode: CTI
+      L1D_plp_CTI_fec_block_start: 204800
+      L1D_plp_type: non-dispersed
+      L1D_plp_TI_extended_interleaving: 0
+      L1D_plp_CTI_depth: 0
+      L1D_plp_CTI_start_row: 400
+      -> PLP Bitrate: 0.033 Mbps
+L1D_bsid: 0x0580
+L1D_crc: 0x63e1b59a
+
+================================================================================
+
+Raw L1 Detail (Base64):
+BikIAAALQHQAIkYGYvEn////////AAAAABDR1DBx0a+bTF1hAQAAAARSuIEHTQM+GAIGgAAACKVxAmqaBnykAIpXEAP0gAAIZAAAMgCwH2PhtZo=

@@ -1,0 +1,137 @@
+ 
+Firmware Version: 20250815
+ 
+L1D BSID: Not set
+SLT TSID: 540 (0x21C)
+ 
+0: sfi=0 mod=qam64 cod=11/15 layer=core ti=hti lls=1 lock=1
+  -> Required SNR: AWGN 14.28 to 14.52 dB, Rayleigh 17.44 to 17.87 dB
+ 
+16: sfi=0 mod=qpsk cod=2/15 layer=core ti=hti lls=0 lock=1
+  -> Required SNR: AWGN -6.23 to -5.55 dB, Rayleigh -5.72 to -5.06 dB
+ 
+1: sfi=1 mod=qam256 cod=11/15 layer=core ti=hti lls=0 lock=1
+  -> Required SNR: AWGN 18.76 to 19.08 dB, Rayleigh 21.94 to 22.40 dB
+ 
+================================================================================
+ 
+--- L1-Basic Signaling ---
+L1B_version: 0
+L1B_mimo_scattered_pilot_encoding: Walsh-Hadamard
+L1B_lls_flag: LLS present
+L1B_time_info_flag: ns precision
+L1B_return_channel_flag: 0
+L1B_papr_reduction: None
+L1B_frame_length_mode: Symbol-aligned
+  L1B_time_offset: 33152
+  L1B_additional_samples: 0
+L1B_num_subframes: 2
+L1B_preamble_num_symbols: 1
+L1B_preamble_reduced_carriers: 0
+L1B_L1_Detail_content_tag: 0
+L1B_L1_Detail_size_bytes: 62
+L1B_L1_Detail_fec_type: Mode 3
+L1B_L1_additional_parity_mode: K=0
+L1B_L1_Detail_total_cells: 867
+L1B_first_sub_mimo: No MIMO
+L1B_first_sub_miso: 0
+L1B_first_sub_fft_size: 8K
+L1B_first_sub_reduced_carriers: 0
+L1B_first_sub_guard_interval: GI_6_1536
+L1B_first_sub_num_ofdm_symbols: 35
+L1B_first_sub_scattered_pilot_pattern: 2
+L1B_first_sub_scattered_pilot_boost: 1
+L1B_first_sub_sbs_first: 1
+L1B_first_sub_sbs_last: 1
+L1B_crc: 0x00000000
+ 
+--- L1-Detail Signaling ---
+L1D_version: 0
+L1D_num_rf: 0
+L1D_time_sec: 1760172156
+L1D_time_msec: 152
+L1D_time_usec: 973
+L1D_time_nsec: 168
+ 
+Subframe #0:
+  L1D_subframe_multiplex: 0
+  L1D_frequency_interleaver: All Symbols
+  L1D_sbs_null_cells: 127
+  L1D_num_plp: 2
+    PLP #0:
+      L1D_plp_id: 0
+      L1D_plp_lls_flag: 1
+      L1D_plp_layer: Core
+      L1D_plp_start: 0
+      L1D_plp_size: 199800
+      L1D_plp_scrambler_type: PRBS
+      L1D_plp_fec_type: BCH + 16K LDPC
+      L1D_plp_mod: 64QAM
+      L1D_plp_cod: 11/15
+      L1D_plp_TI_mode: HTI
+      L1D_plp_type: non-dispersed
+      L1D_plp_HTI_inter_subframe: 0
+      L1D_plp_HTI_num_ti_blocks: 2
+      L1D_plp_HTI_num_fec_blocks_max: 74
+      L1D_plp_HTI_num_fec_blocks: 74
+      L1D_plp_HTI_cell_interleaver: 0
+      -> PLP Bitrate: 16.456 Mbps
+    PLP #1:
+      L1D_plp_id: 16
+      L1D_plp_lls_flag: 0
+      L1D_plp_layer: Core
+      L1D_plp_start: 199800
+      L1D_plp_size: 8100
+      L1D_plp_scrambler_type: PRBS
+      L1D_plp_fec_type: BCH + 16K LDPC
+      L1D_plp_mod: QPSK
+      L1D_plp_cod: 2/15
+      L1D_plp_TI_mode: HTI
+      L1D_plp_type: non-dispersed
+      L1D_plp_TI_extended_interleaving: 0
+      L1D_plp_HTI_inter_subframe: 0
+      L1D_plp_HTI_num_ti_blocks: 1
+      L1D_plp_HTI_num_fec_blocks_max: 1
+      L1D_plp_HTI_num_fec_blocks: 1
+      L1D_plp_HTI_cell_interleaver: 0
+      -> PLP Bitrate: 0.038 Mbps
+ 
+Subframe #1:
+  L1D_mimo: No MIMO
+  L1D_miso: 0
+  L1D_fft_size: 16K
+  L1D_reduced_carriers: 0
+  L1D_guard_interval: GI_6_1536
+  L1D_num_ofdm_symbols: 75
+  L1D_scattered_pilot_pattern: 3
+  L1D_scattered_pilot_boost: 1
+  L1D_sbs_first: 1
+  L1D_sbs_last: 1
+  L1D_subframe_multiplex: 0
+  L1D_frequency_interleaver: All Symbols
+  L1D_sbs_null_cells: 1609
+  L1D_num_plp: 1
+    PLP #0:
+      L1D_plp_id: 1
+      L1D_plp_lls_flag: 0
+      L1D_plp_layer: Core
+      L1D_plp_start: 0
+      L1D_plp_size: 947700
+      L1D_plp_scrambler_type: PRBS
+      L1D_plp_fec_type: BCH + 64K LDPC
+      L1D_plp_mod: 256QAM
+      L1D_plp_cod: 11/15
+      L1D_plp_TI_mode: HTI
+      L1D_plp_type: non-dispersed
+      L1D_plp_HTI_inter_subframe: 0
+      L1D_plp_HTI_num_ti_blocks: 3
+      L1D_plp_HTI_num_fec_blocks_max: 117
+      L1D_plp_HTI_num_fec_blocks: 117
+      L1D_plp_HTI_cell_interleaver: 0
+      -> PLP Bitrate: 22.408 Mbps
+L1D_crc: 0x1a873b3d
+
+================================================================================
+
+Raw L1 Detail (Base64):
+DjAwAABAAHyABsYAwIhH////////AAAAAADR1DD4THmlQgfwQIAAAABhjwAUwIJIJJAAYY8AA/SAAEAAAAABDBKGdMkgAgAAAAOdfQE5ggdAdH8ahzs9
