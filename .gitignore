@@ -53,3 +53,11 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Since the program might be built on different OSes, don't upload the binary to the repo.
+render
+
+# Ignore any binary artifacts in libhdhomerun
+hdhomerun_config
+hdhomerun_config_x64
+hdhomerun_config_arm64
