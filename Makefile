@@ -5,10 +5,24 @@ UNAME_S := $(shell uname -s)
 
 # Compiler and Flags
 CC = gcc
-CFLAGS = -Wall -g -Ilibhdhomerun $(shell pkg-config --cflags libxml-2.0 libavcodec libavutil)
+
+# Platform-specific OpenSSL detection (macOS Homebrew installs OpenSSL as keg-only)
+ifeq ($(UNAME_S),Darwin)
+    BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
+    ifneq ($(BREW_PREFIX),)
+        OPENSSL_PREFIX := $(shell brew --prefix openssl 2>/dev/null)
+        ifneq ($(OPENSSL_PREFIX),)
+            export PKG_CONFIG_PATH := $(OPENSSL_PREFIX)/lib/pkgconfig:$(PKG_CONFIG_PATH)
+            OPENSSL_CFLAGS := -I$(OPENSSL_PREFIX)/include
+            OPENSSL_LDFLAGS := -L$(OPENSSL_PREFIX)/lib
+        endif
+    endif
+endif
+
+CFLAGS = -Wall -g -Ilibhdhomerun $(OPENSSL_CFLAGS) $(shell pkg-config --cflags libxml-2.0 libavcodec libavutil)
 
 # Base libraries (common to all platforms)
-LIBS = $(shell pkg-config --libs libxml-2.0 libavcodec libavutil) -lpcap -lz -lssl -lcrypto
+LIBS = $(shell pkg-config --libs libxml-2.0 libavcodec libavutil) -lpcap -lz $(OPENSSL_LDFLAGS) -lssl -lcrypto
 
 # Platform-specific configuration
 ifeq ($(UNAME_S),Darwin)
