@@ -110,13 +110,14 @@ void parse_mpi_message_improved(const uint8_t* pos, size_t msg_length,
 
 // Functions from a3render.c that mmt.c needs to call
 const char* get_stream_description(const char* destIp, const char* destPort, uint32_t tsi_or_pid);
-void record_data_usage(const char* dest_ip, const char* dest_port, uint32_t tsi_or_packet_id, 
-                      uint32_t packet_bytes, const char* description);
+void record_data_usage(const char* dest_ip, const char* dest_port, uint32_t tsi_or_packet_id,
+                       uint32_t packet_bytes, const char* description, const struct timeval* timestamp,
+                       const uint8_t* payload, int payload_len);
 const char* get_media_type_from_mpt(const char* dest_ip, const char* dest_port, uint32_t packet_id);
 char* decompress_gzip(const u_char *compressed_data, int len, int *decompressed_size, int* consumed_size);
 int parse_xml(const char* xml_data, int len, TableType* type, void** parsed_data, const char* source_id);
 void store_unique_table(const char* content, int len, TableType type, void* parsed_data, 
-                        const char* destIp, const char* destPort);
+                        const char* destIp, const char* destPort, int is_in_smt, int smt_sig_index);
 char* extract_node_as_xml(xmlNodePtr node);
 int is_gzip_complete(const uint8_t* buffer, size_t size);
 int is_xml_complete(const char* buffer, size_t size);

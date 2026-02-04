@@ -14,7 +14,7 @@
  *****************************************************************************/
 #define _GNU_SOURCE // For memmem
 
-#define RENDER_VERSION "0.2.0"
+#define RENDER_VERSION "0.3.0"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +43,10 @@
 #include "bps.h"
 #include "utility.h"
 #include "mmt.h"
+
+// Forward declaration for STLTP L1 parsing
+// We'll write the base64 to a temp file and use the existing parser
+#include <unistd.h>  // for unlink
 
 // LMT specific constants
 #define LMT_TABLE_ID 0x01
@@ -137,12 +141,10 @@ typedef struct BroadSpanServiceInfo {
 typedef struct {
     char version[16];
     BroadSpanServiceInfo* head_service;
+    UdsData* head_uds;  // For simple UDS entries (uses same struct as standalone UDS)
 } UdstData;
 
-// For SMT Signature blocks
-typedef struct {
-    int signature_len;
-} SignatureData;
+// For SMT Signature blocks - now defined in structures.h
 
 // For FDT: A single file entry
 typedef struct FDTFileInfo {
@@ -250,12 +252,23 @@ typedef struct ContentRatingInfo {
     struct ContentRatingInfo* next;
 } ContentRatingInfo;
 
+// For S-TSID: a file entry from embedded EFDT
+typedef struct StsidFileEntry {
+    uint32_t toi;
+    char content_location[256];
+    uint64_t content_length;
+    char content_type[64];
+    struct StsidFileEntry* next;
+} StsidFileEntry;
+
 // For S-TSID: a single logical stream
 typedef struct StsidLogicalStream {
     char tsi[16];
     char repId[64];
     char contentType[64];
     ContentRatingInfo* head_rating;
+    StsidFileEntry* head_file;      // File manifest from embedded EFDT
+    int file_count;
     struct StsidLogicalStream* next;
 } StsidLogicalStream;
 
@@ -291,19 +304,24 @@ static int g_service_dest_count = 0;
 static ReassemblyBuffer* g_reassembly_head = NULL;
 static char g_input_filename[512] = "";
 static int g_input_type = INPUT_TYPE_PCAP;
+static int g_original_input_type = INPUT_TYPE_PCAP;
 static struct timeval g_first_packet_time = {0, 0};
 static struct timeval g_last_packet_time = {0, 0};
 static int g_pcap_timing_valid = 0;
 static DataUsageEntry g_data_usage[MAX_DATA_STREAMS];
 static int g_data_usage_count = 0;
 static uint64_t g_total_capture_bytes = 0;
-static int g_route_packet_count_196810 = 0;
 static BpsData* g_bps_data = NULL;
+
+// eGPS support
+#include "egps.h"
 
 // --- Function Prototypes ---
 void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *packet);
 void process_lls_payload(const u_char *payload, int len);
 void process_route_payload(const u_char* payload, int len, const char* destIp, const char* destPort);
+uint32_t get_lct_tsi(const u_char* payload, int len);
+uint32_t get_lct_toi(const u_char* payload, int len);
 uint16_t get_route_header_length(const u_char* payload, int len);
 uint16_t get_route_payload_offset(const u_char* payload, int len);
 void process_mime_object(uint32_t toi, const uint8_t* buffer, size_t size, const char* boundary_str, const char* destIp, const char* destPort);
@@ -311,7 +329,7 @@ void process_terminal_payload(uint32_t toi, const uint8_t* buffer, size_t size, 
 void process_and_store_route_object(uint32_t toi, const uint8_t* buffer, size_t size, const char* destIp, const char* destPort);
 void store_slt_destinations(SltData* slt_data);
 char* decompress_gzip(const u_char *compressed_data, int len, int *decompressed_size, int* consumed_size);
-void store_unique_table(const char* content, int len, TableType type, void* parsed_data, const char* destIp, const char* destPort);
+void store_unique_table(const char* content, int len, TableType type, void* parsed_data, const char* destIp, const char* destPort, int is_in_smt, int smt_sig_index);
 void generate_html_report(const char* filename);
 int is_gzip_complete(const uint8_t* buffer, size_t size);
 int is_xml_complete(const char* buffer, size_t size);
@@ -341,6 +359,7 @@ int get_plps_for_service_enhanced(const char* dest_ip, const char* dest_port, ch
 int parse_xml(const char* xml_content, int len, TableType* type, void** parsed_data_out, const char* source_identifier);
 SltData* parse_slt(xmlDocPtr doc);
 SystemTimeData* parse_system_time(xmlDocPtr doc);
+RrtData* parse_rrt(xmlDocPtr doc);
 UctData* parse_uct(xmlDocPtr doc);
 UdstData* parse_udst(xmlDocPtr doc);
 FDTInstanceData* parse_fdt(xmlDocPtr doc);
@@ -354,13 +373,177 @@ char* extract_node_as_xml(xmlNodePtr node);
 UsdbData* parse_usbd(xmlDocPtr doc);
 UsdData* parse_usd(xmlDocPtr doc);
 DwdData* parse_dwd(xmlDocPtr doc);
+UdsData* parse_uds(xmlDocPtr doc);
+UdsData* parse_uds_from_node(xmlNodePtr node);
+AeatData* parse_aeat(xmlDocPtr doc);
 ServiceSignalingData* parse_service_signaling(xmlDocPtr doc);
 MpTableData* parse_mp_table(xmlDocPtr doc);
 int is_esg_service(const char* destIp, const char* destPort);
 int is_bps_service(const char* destIp, const char* destPort);
+int is_egps_service(const char* destIp, const char* destPort);
 int normalize_xml_content(const char* xml_content, char* normalized_buffer, size_t buffer_size);
 char* normalize_xml_declaration(const char* xml_content);
 int is_functionally_equivalent(const char* content1, const char* content2);
+
+/**
+ * @brief Decodes AC-3/Dolby Digital Plus channel configuration from hex bitfield.
+ * 
+ * The value is a 4-digit hex representation of a 16-bit bitfield where each bit
+ * represents channel presence. Bit 0 (MSB) is L, pairs count as 2 channels.
+ * Per Dolby spec: tag:dolby.com,2014:dash:audio_channel_configuration:2011
+ * 
+ * @param hex_value The hex string (4 characters like "a000")
+ * @param channel_count Output buffer for the channel count string
+ * @param buffer_size Size of the output buffer
+ * @return 1 if successfully decoded, 0 otherwise
+ */
+static int decode_ac3_channel_config(const char* hex_value, char* channel_count, size_t buffer_size) {
+    if (!hex_value || strlen(hex_value) != 4) return 0;
+    
+    unsigned int bitfield = 0;
+    if (sscanf(hex_value, "%04x", &bitfield) != 1) return 0;
+    
+    // Count channels - bits are numbered from MSB (bit 0 = L)
+    // Bit 0: L, Bit 1: C, Bit 2: R, Bit 3: Ls, Bit 4: Rs (single channels)
+    // Bit 5: Lc/Rc pair, Bit 6: Lrs/Rrs pair (2 channels each)
+    // Bit 7: Cs, Bit 8: Ts (single channels)
+    // Bit 9: Lsd/Rsd pair, Bit 10: Lw/Rw pair, Bit 11: Lvh/Rvh pair (2 channels each)
+    // Bit 12: Cvh (single)
+    // Bit 13: Lts/Rts pair (2 channels)
+    // Bit 14: LFE2, Bit 15: LFE (single channels)
+    
+    int channels = 0;
+    
+    // Single channel bits: 0, 1, 2, 3, 4, 7, 8, 12, 14, 15
+    if (bitfield & 0x8000) channels++;  // Bit 0: L
+    if (bitfield & 0x4000) channels++;  // Bit 1: C
+    if (bitfield & 0x2000) channels++;  // Bit 2: R
+    if (bitfield & 0x1000) channels++;  // Bit 3: Ls
+    if (bitfield & 0x0800) channels++;  // Bit 4: Rs
+    if (bitfield & 0x0400) channels += 2;  // Bit 5: Lc/Rc pair
+    if (bitfield & 0x0200) channels += 2;  // Bit 6: Lrs/Rrs pair
+    if (bitfield & 0x0100) channels++;  // Bit 7: Cs
+    if (bitfield & 0x0080) channels++;  // Bit 8: Ts
+    if (bitfield & 0x0040) channels += 2;  // Bit 9: Lsd/Rsd pair
+    if (bitfield & 0x0020) channels += 2;  // Bit 10: Lw/Rw pair
+    if (bitfield & 0x0010) channels += 2;  // Bit 11: Lvh/Rvh pair
+    if (bitfield & 0x0008) channels++;  // Bit 12: Cvh
+    if (bitfield & 0x0004) channels += 2;  // Bit 13: Lts/Rts pair
+    if (bitfield & 0x0002) channels++;  // Bit 14: LFE2
+    if (bitfield & 0x0001) channels++;  // Bit 15: LFE
+    
+    snprintf(channel_count, buffer_size, "%d", channels);
+    return 1;
+}
+
+/**
+ * @brief Decodes AC-4 channel configuration from hex value.
+ * 
+ * The value is a 6-digit hex representation per Dolby AC-4 spec.
+ * Per Dolby spec: urn:dolby:dash:audio_channel_configuration:2015
+ * 
+ * @param hex_value The hex string (6 characters)
+ * @param channel_count Output buffer for the channel count string
+ * @param buffer_size Size of the output buffer
+ * @return 1 if successfully decoded, 0 otherwise
+ */
+static int decode_ac4_channel_config(const char* hex_value, char* channel_count, size_t buffer_size) {
+    if (!hex_value || strlen(hex_value) != 6) return 0;
+    
+    unsigned int value = 0;
+    if (sscanf(hex_value, "%06x", &value) != 1) return 0;
+    
+    // Map known AC-4 hex values to channel counts
+    switch (value) {
+        case 0x000002: snprintf(channel_count, buffer_size, "1"); break;   // 1.0 (C)
+        case 0x000001: snprintf(channel_count, buffer_size, "2"); break;   // 2.0 (L, R)
+        case 0x000047: snprintf(channel_count, buffer_size, "6"); break;   // 5.1
+        case 0x0000C7: snprintf(channel_count, buffer_size, "8"); break;   // 5.1.2
+        case 0x000077: snprintf(channel_count, buffer_size, "10"); break;  // 5.1.4
+        case 0x0000CF: snprintf(channel_count, buffer_size, "10"); break;  // 7.1.2
+        case 0x00007F: snprintf(channel_count, buffer_size, "12"); break;  // 7.1.4
+        default:
+            // Unknown value - store as-is
+            snprintf(channel_count, buffer_size, "%s", hex_value);
+            return 1;
+    }
+    return 1;
+}
+
+/**
+ * @brief Parses AudioChannelConfiguration element and extracts channel count.
+ * 
+ * Handles multiple schemeIdUri formats:
+ * - tag:dolby.com,2014:dash:audio_channel_configuration:2011 (AC-3/DD+, 4-digit hex bitfield)
+ * - urn:dolby:dash:audio_channel_configuration:2015 (AC-4, 6-digit hex)
+ * - urn:mpeg:dash:23003:3:audio_channel_configuration:2011 (MPEG, decimal)
+ * - urn:mpeg:mpegB:cicp:ChannelConfiguration (MPEG CICP, decimal)
+ * 
+ * @param audio_config_node The AudioChannelConfiguration XML node
+ * @param channel_count Output buffer for the channel count string
+ * @param buffer_size Size of the output buffer
+ * @return 1 if successfully parsed, 0 otherwise
+ */
+static int parse_audio_channel_config(xmlNodePtr audio_config_node, char* channel_count, size_t buffer_size) {
+    if (!audio_config_node) return 0;
+    
+    xmlChar* scheme_uri = xmlGetProp(audio_config_node, (const xmlChar*)"schemeIdUri");
+    xmlChar* value = xmlGetProp(audio_config_node, (const xmlChar*)"value");
+    
+    if (!value) {
+        if (scheme_uri) xmlFree(scheme_uri);
+        return 0;
+    }
+    
+    int result = 0;
+    
+    if (scheme_uri) {
+        if (strstr((char*)scheme_uri, "tag:dolby.com,2014:dash:audio_channel_configuration:2011") != NULL) {
+            // AC-3/Dolby Digital Plus - 4-digit hex bitfield
+            result = decode_ac3_channel_config((char*)value, channel_count, buffer_size);
+        } else if (strstr((char*)scheme_uri, "urn:dolby:dash:audio_channel_configuration:2015") != NULL) {
+            // AC-4 - 6-digit hex value
+            result = decode_ac4_channel_config((char*)value, channel_count, buffer_size);
+        } else if (strstr((char*)scheme_uri, "urn:mpeg:dash:23003:3:audio_channel_configuration:2011") != NULL ||
+                   strstr((char*)scheme_uri, "urn:mpeg:mpegB:cicp:ChannelConfiguration") != NULL) {
+            // MPEG standard - decimal value
+            strncpy(channel_count, (char*)value, buffer_size - 1);
+            channel_count[buffer_size - 1] = '\0';
+            result = 1;
+        } else {
+            // Unknown scheme - try to interpret value intelligently
+            size_t len = strlen((char*)value);
+            if (len == 4 && strspn((char*)value, "0123456789abcdefABCDEF") == 4) {
+                // Looks like AC-3 4-digit hex
+                result = decode_ac3_channel_config((char*)value, channel_count, buffer_size);
+            } else if (len == 6 && strspn((char*)value, "0123456789abcdefABCDEF") == 6) {
+                // Looks like AC-4 6-digit hex
+                result = decode_ac4_channel_config((char*)value, channel_count, buffer_size);
+            } else {
+                // Assume decimal
+                strncpy(channel_count, (char*)value, buffer_size - 1);
+                channel_count[buffer_size - 1] = '\0';
+                result = 1;
+            }
+        }
+        xmlFree(scheme_uri);
+    } else {
+        // No schemeIdUri - guess based on value format
+        size_t len = strlen((char*)value);
+        if (len == 4 && strspn((char*)value, "0123456789abcdefABCDEF") == 4) {
+            result = decode_ac3_channel_config((char*)value, channel_count, buffer_size);
+        } else if (len == 6 && strspn((char*)value, "0123456789abcdefABCDEF") == 6) {
+            result = decode_ac4_channel_config((char*)value, channel_count, buffer_size);
+        } else {
+            strncpy(channel_count, (char*)value, buffer_size - 1);
+            channel_count[buffer_size - 1] = '\0';
+            result = 1;
+        }
+    }
+    
+    xmlFree(value);
+    return result;
+}
 
 // Cleanup functions for parsed data
 void free_parsed_data(LlsTable* table);
@@ -394,7 +577,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Supported file types:\n");
         fprintf(stderr, "  .pcap/.pcapng - Standard PCAP capture files\n");
         fprintf(stderr, "  .dbg - ATSC 3.0 debug files\n");
-        fprintf(stderr, "  ALP-PCAP files (detected by filename containing 'alp')\n");
+        fprintf(stderr, "  ALP-PCAP files (link type 289 / DLT_ATSC_ALP)\n");
+        fprintf(stderr, "  STLTP files (auto-detected by RTP PT=97 outer tunnel)\n");
         return 1;
     }
 
@@ -403,6 +587,7 @@ int main(int argc, char *argv[]) {
     uint8_t *virtual_pcap_data = NULL;
     size_t virtual_pcap_size = 0;
     int input_type = detect_file_type(argv[1]);
+    g_original_input_type = input_type;
     
     if (input_type == INPUT_TYPE_DEBUG) {
         printf("Detected debug file format: %s\n", argv[1]);
@@ -428,6 +613,82 @@ int main(int argc, char *argv[]) {
         
         printf("Successfully converted debug file to virtual PCAP\n");
         
+        
+    } else if (input_type == INPUT_TYPE_STLTP) {
+        printf("Detected STLTP file format: %s\n", argv[1]);
+        
+        char *l1_basic_b64 = NULL;
+        char *l1_detail_b64 = NULL;
+        
+        // Use input.c function to extract ALP data and L1 signaling from STLTP
+        if (create_virtual_alp_pcap_from_stltp(argv[1], &virtual_pcap_data, &virtual_pcap_size,
+                                               &l1_basic_b64, &l1_detail_b64) != 0) {
+            fprintf(stderr, "Error processing STLTP file\n");
+            return 1;
+        }
+        
+        // Parse and store L1 signaling data if present
+        // Note: l1_detail_b64 contains the COMBINED L1-Basic + L1-Detail data
+        if (l1_detail_b64) {
+            printf("L1 signaling extracted from STLTP preamble\n");
+            printf("  Combined base64 (%zu chars): %.60s%s\n",
+                   strlen(l1_detail_b64),
+                   l1_detail_b64,
+                   strlen(l1_detail_b64) > 60 ? "..." : "");
+            
+            // Write combined base64 to temp file and use existing L1 parser
+            char temp_l1_file[] = "/tmp/stltp_l1_XXXXXX.txt";
+            int fd = mkstemps(temp_l1_file, 4);
+            if (fd >= 0) {
+                FILE *l1f = fdopen(fd, "w");
+                if (l1f) {
+                    // Write combined L1 base64 - matches format parser expects
+                    fprintf(l1f, "%s\n", l1_detail_b64);
+                    fclose(l1f);
+                    
+                    printf("  Wrote L1 base64 to temp file: %s\n", temp_l1_file);
+                    
+                    // Parse using existing infrastructure
+                    void *l1_data = parse_enhanced_l1_signaling_file(temp_l1_file);
+                    if (l1_data) {
+                        set_enhanced_l1_signaling_data(l1_data);
+                        printf("  L1 signaling parsed successfully!\n");
+                        unlink(temp_l1_file);  // Clean up temp file on success
+                    } else {
+                        printf("  WARNING: L1 parser returned NULL - check base64 format\n");
+                        printf("  Temp file preserved for inspection: %s\n", temp_l1_file);
+                    }
+                } else {
+                    close(fd);
+                    printf("  ERROR: Could not write to temp file\n");
+                }
+            } else {
+                printf("  ERROR: Could not create temp file\n");
+            }
+            
+            free(l1_detail_b64);
+        }
+        
+        if (l1_basic_b64) {
+            free(l1_basic_b64);
+        }
+        
+        // Check if we got any data
+        if (virtual_pcap_size <= 24) {
+            fprintf(stderr, "Warning: No ALP data found in STLTP file\n");
+        }
+        
+        // The extracted data is ALP format
+        input_type = INPUT_TYPE_ALP_PCAP;
+        
+        // Create a dead handle for ALP processing
+        handle = pcap_open_dead(DLT_ATSC_ALP, 65535);
+        if (handle == NULL) {
+            fprintf(stderr, "Error creating virtual PCAP handle for STLTP\n");
+            free(virtual_pcap_data);
+            return 1;
+        }
+        
     } else {
         printf("Opening %s file: %s\n", 
                (input_type == INPUT_TYPE_ALP_PCAP) ? "ALP-PCAP" : "PCAP", 
@@ -444,10 +705,13 @@ int main(int argc, char *argv[]) {
     g_input_type = input_type;
     
     // Check for and parse optional L1 signaling file
-    char* txt_filename = get_txt_filename_from_input(argv[1]);
-    if (txt_filename) {
-        set_enhanced_l1_signaling_data(parse_enhanced_l1_signaling_file(txt_filename));
-        free(txt_filename);
+    // But skip this if we already have L1 data from STLTP preamble
+    if (!get_enhanced_l1_signaling_data()) {
+        char* txt_filename = get_txt_filename_from_input(argv[1]);
+        if (txt_filename) {
+            set_enhanced_l1_signaling_data(parse_enhanced_l1_signaling_file(txt_filename));
+            free(txt_filename);
+        }
     }
 
     // Determine the link-layer header type
@@ -477,14 +741,16 @@ int main(int argc, char *argv[]) {
         g_lls_tables[i].type = TABLE_TYPE_UNKNOWN;
         g_lls_tables[i].destinationIp[0] = '\0';
         g_lls_tables[i].destinationPort[0] = '\0';
+        g_lls_tables[i].is_in_smt = 0;
+        g_lls_tables[i].smt_signature_index = -1;
     }
     
     // Initialize libxml2
     LIBXML_TEST_VERSION
 
-    // For debug files, we need to manually process the virtual PCAP data
-    if (input_type == INPUT_TYPE_DEBUG) {
-        printf("Processing virtual PCAP data from debug file...\n");
+    // For debug/STLTP files, we need to manually process the virtual PCAP data
+    if (virtual_pcap_data != NULL) {
+        printf("Processing virtual PCAP data (%zu bytes)...\n", virtual_pcap_size);
         
         // Process the virtual PCAP data manually
         const uint8_t *data = virtual_pcap_data + 24; // Skip global header
@@ -541,7 +807,8 @@ int main(int argc, char *argv[]) {
         
         // Check if buffer looks complete despite missing close flag
         // If it has MIME boundaries and looks complete, skip it
-        if (memmem(current_buf->buffer, current_buf->size, "multipart/related", 17)) {
+        if (memmem(current_buf->buffer, current_buf->size, "multipart/related", 17) ||
+                (current_buf->size > 13 && memcmp(current_buf->buffer, "MIME-Version:", 13) == 0)) {
             // Check if it has final boundary marker
             const char* boundary_marker = "boundary=\"";
             const uint8_t* boundary_loc = memmem(current_buf->buffer, 
@@ -577,6 +844,7 @@ int main(int argc, char *argv[]) {
                 memcmp(current_buf->buffer, "<MPD", 4) == 0 ||
                 memcmp(current_buf->buffer, "<S-TSID", 7) == 0 ||
                 memcmp(current_buf->buffer, "Content-Type:", 13) == 0 ||
+                memcmp(current_buf->buffer, "MIME-Version:", 13) == 0 ||
                 (current_buf->buffer[0] == 0x1f && current_buf->buffer[1] == 0x8b)) { // gzip
                 looks_valid = 1;
             }
@@ -656,7 +924,8 @@ int main(int argc, char *argv[]) {
 }
 
 void record_data_usage(const char* dest_ip, const char* dest_port, uint32_t tsi_or_packet_id, 
-                      uint32_t packet_bytes, const char* description) {
+                      uint32_t packet_bytes, const char* description, const struct timeval* timestamp,
+                      const uint8_t* payload, int payload_len) {
     g_total_capture_bytes += packet_bytes;
     
     // Find existing entry or create new one
@@ -682,17 +951,38 @@ void record_data_usage(const char* dest_ip, const char* dest_port, uint32_t tsi_
         strncpy(entry->description, description, sizeof(entry->description) - 1);
         entry->description[sizeof(entry->description) - 1] = '\0';
         entry->is_lls = (strcmp(dest_ip, "224.0.23.60") == 0 && strcmp(dest_port, "4937") == 0);
+        entry->timing_valid = 0;
+        entry->sample_payload_len = 0;
+        entry->sample_collected = 0;
         
         // Determine stream type and signaling flag
         if (entry->is_lls) {
             strcpy(entry->stream_type, "LLS");
             entry->is_signaling = 1;
+        } else if (strstr(description, "Stuffing") || strstr(description, "Non-UDP")) {
+            strcpy(entry->stream_type, "Stuffing");
+            entry->is_signaling = 0;
         } else if (strstr(description, "ROUTE")) {
             strcpy(entry->stream_type, "ROUTE");
             entry->is_signaling = (tsi_or_packet_id == 0);
         } else if (strstr(description, "MMT")) {
             strcpy(entry->stream_type, "MMT");
             entry->is_signaling = (strstr(description, "Signaling") != NULL);
+        } else if (strstr(description, "RTP/MPEG-TS Null")) {
+            strcpy(entry->stream_type, "RTP/MPEG-TS Null");
+            entry->is_signaling = 0;
+        } else if (strstr(description, "RTP/MPEG-TS")) {
+            strcpy(entry->stream_type, "RTP/MPEG-TS");
+            entry->is_signaling = 0;
+        } else if (strstr(description, "MPEG-TS Null")) {
+            strcpy(entry->stream_type, "MPEG-TS Null");
+            entry->is_signaling = 0;
+        } else if (strstr(description, "MPEG-TS")) {
+            strcpy(entry->stream_type, "MPEG-TS");
+            entry->is_signaling = 0;
+        } else if (strstr(description, "RTP")) {
+            strcpy(entry->stream_type, "RTP");
+            entry->is_signaling = 0;
         } else {
             strcpy(entry->stream_type, "Other UDP");
             entry->is_signaling = 0;
@@ -704,6 +994,86 @@ void record_data_usage(const char* dest_ip, const char* dest_port, uint32_t tsi_
     if (entry) {
         entry->total_bytes += packet_bytes;
         entry->packet_count++;
+        
+        // Capture sample payload for unknown services (only once)
+        if (!entry->sample_collected && payload && payload_len > 0) {
+            // Check if this is an unknown service
+            const char* service_name = get_service_name_for_destination(entry->destinationIp, entry->destinationPort);
+            if (!service_name && !entry->is_lls && !entry->is_signaling) {
+                int copy_len = payload_len > (int)sizeof(entry->sample_payload) ? (int)sizeof(entry->sample_payload) : payload_len;
+                memcpy(entry->sample_payload, payload, copy_len);
+                entry->sample_payload_len = copy_len;
+                entry->sample_collected = 1;
+            }
+        }
+        
+        // Also try to capture sample for UDS streams (standalone UDS and inside UDST)
+        if (payload && payload_len > 0) {
+            for (int i = 0; i < g_lls_table_count; i++) {
+                // Check standalone UDS tables
+                if (g_lls_tables[i].type == TABLE_TYPE_UDS) {
+                    UdsData* uds = (UdsData*)g_lls_tables[i].parsed_data;
+                    if (uds && !uds->sample_collected &&
+                        strcmp(uds->destIP, dest_ip) == 0 &&
+                        strcmp(uds->destPort, dest_port) == 0) {
+                        int copy_len = payload_len > (int)sizeof(uds->sample_payload) ? (int)sizeof(uds->sample_payload) : payload_len;
+                        memcpy(uds->sample_payload, payload, copy_len);
+                        uds->sample_payload_len = copy_len;
+                        uds->sample_collected = 1;
+                    }
+                }
+                // Check UDS entries inside UDST tables
+                else if (g_lls_tables[i].type == TABLE_TYPE_UDST) {
+                    UdstData* udst = (UdstData*)g_lls_tables[i].parsed_data;
+                    if (udst) {
+                        UdsData* uds = udst->head_uds;
+                        while (uds) {
+                            if (!uds->sample_collected &&
+                                strcmp(uds->destIP, dest_ip) == 0 &&
+                                strcmp(uds->destPort, dest_port) == 0) {
+                                int copy_len = payload_len > (int)sizeof(uds->sample_payload) ? (int)sizeof(uds->sample_payload) : payload_len;
+                                memcpy(uds->sample_payload, payload, copy_len);
+                                uds->sample_payload_len = copy_len;
+                                uds->sample_collected = 1;
+                            }
+                            uds = uds->next;
+                        }
+                    }
+                }
+            }
+            
+            // Check for eGPS data - look for Cambium magic bytes (0xBCA1)
+            if (is_egps_service(dest_ip, dest_port) && payload_len >= 8) {
+                // Check for Cambium packet magic
+                if (payload[0] == 0xBC && payload[1] == 0xA1) {
+                    // Parse the eGPS packet(s)
+                    EgpsData* egps = parse_egps_stream(payload, payload_len, dest_ip, dest_port);
+                    if (egps && egps->location_fix_count > 0) {
+                        if (store_egps_data(egps)) {
+                            printf("DEBUG: Collected eGPS data for %s:%s (%d fixes)\n",
+                                   dest_ip, dest_port, egps->location_fix_count);
+                        } else {
+                            free_egps_data(egps);
+                        }
+                    } else if (egps) {
+                        free_egps_data(egps);
+                    }
+                }
+            }
+        }
+        
+        // Update per-stream timing for ALP-PCAP files
+        if (g_input_type == INPUT_TYPE_ALP_PCAP && timestamp) {
+            if (!entry->timing_valid) {
+                // First packet for this stream
+                entry->first_packet_time = *timestamp;
+                entry->last_packet_time = *timestamp;
+                entry->timing_valid = 1;
+            } else {
+                // Update last packet time
+                entry->last_packet_time = *timestamp;
+            }
+        }
     }
 }
 
@@ -765,7 +1135,7 @@ const char* get_stream_description(const char* dest_ip, const char* dest_port, u
 }
 
 void update_packet_timing(const struct pcap_pkthdr *pkthdr) {
-    if (g_input_type == INPUT_TYPE_PCAP) {
+    if (g_input_type == INPUT_TYPE_PCAP || g_input_type == INPUT_TYPE_ALP_PCAP) {
         if (g_packet_count == 1) {
             // First packet
             g_first_packet_time = pkthdr->ts;
@@ -1094,12 +1464,8 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
     
     g_packet_count++;
     
-    // ADD THIS
-    printf("=== PACKET %d ===\n", g_packet_count);
-    // END DEBUG
-    
     update_packet_timing(pkthdr);
-    
+
     if (g_link_type == DLT_ATSC_ALP) {
         const u_char* ip_payload;
         const u_char* signaling_payload;
@@ -1114,46 +1480,27 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
             return;  // Skip to next packet
         }
         
-        // ADD THIS DEBUG
-        printf("DEBUG ALP PARSE: result=%d, ip_len=%d, signaling_len=%d\n", result, ip_len, signaling_len);
-        if (result == 0 && ip_payload && ip_len >= 20) {
-            const struct ip *ip_hdr = (struct ip*)ip_payload;
-            char debug_dst[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &ip_hdr->ip_dst, debug_dst, sizeof(debug_dst));
-            
-            if (ip_hdr->ip_p == IPPROTO_UDP && ip_len >= 20 + 8) {
-                const struct udphdr *udp = (struct udphdr*)((u_char*)ip_hdr + (ip_hdr->ip_hl * 4));
-                printf("DEBUG ALP PARSE: IPv4 UDP to %s:%d\n", debug_dst, ntohs(udp->uh_dport));
-            }
-        }
-        // END DEBUG
-
-        
         if (result == 0 && ip_payload) {
             // Process IP packet using existing logic
             const struct ip *ip_header = (struct ip*)ip_payload;
             if (!ip_header) {
-                printf("DEBUG: NULL ip_header in ALP packet %d\n", g_packet_count);
                 return;
             }
             
             int ip_header_len = ip_header->ip_hl * 4;
 
             if (ip_header->ip_p != IPPROTO_UDP) {
+                char dest_ip_str[40];
+                inet_ntop(AF_INET, &ip_header->ip_dst, dest_ip_str, sizeof(dest_ip_str));
+                record_data_usage(dest_ip_str, "N/A", 0, pkthdr->caplen, 
+                        "ALP Non-UDP IP (Stuffing)", &pkthdr->ts, NULL, 0);
                 return;
             }
 
             const struct udphdr *udp_header = (struct udphdr*)((u_char*)ip_header + ip_header_len);
             if (!udp_header) {
-                printf("DEBUG: NULL udp_header in ALP packet %d\n", g_packet_count);
                 return;
             }
-            printf("DEBUG: sizeof(struct udphdr) = %zu\n", sizeof(struct udphdr));
-            printf("DEBUG: udp_header bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                ((u_char*)udp_header)[0], ((u_char*)udp_header)[1], 
-                ((u_char*)udp_header)[2], ((u_char*)udp_header)[3],
-                ((u_char*)udp_header)[4], ((u_char*)udp_header)[5],
-                ((u_char*)udp_header)[6], ((u_char*)udp_header)[7]);
             
             const u_char *udp_payload = (u_char*)udp_header + sizeof(struct udphdr);
             int udp_payload_len = ntohs(udp_header->uh_ulen) - sizeof(struct udphdr);
@@ -1163,8 +1510,6 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
             char dest_port_str[16];
             inet_ntop(AF_INET, &ip_header->ip_dst, dest_ip_str, sizeof(dest_ip_str));
             snprintf(dest_port_str, sizeof(dest_port_str), "%u", ntohs(udp_header->uh_dport));
-            
-            //printf("DEBUG: ALP UDP Packet %d - %s:%s, len=%d\n", g_packet_count, dest_ip_str, dest_port_str, udp_payload_len);
             
             // Check if this is a BPS packet
             if (is_bps_service(dest_ip_str, dest_port_str)) {
@@ -1176,7 +1521,7 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
                 }
                 
                 record_data_usage(dest_ip_str, dest_port_str, 0, pkthdr->caplen, 
-                                "Broadcast Positioning System (BPS)");
+                                "Broadcast Positioning System (BPS)", &pkthdr->ts, NULL, 0);
                 return;  // Don't process as regular ROUTE/MMT
             }
             
@@ -1186,8 +1531,8 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
             
             if (is_lls) {
                 process_lls_payload(udp_payload, udp_payload_len);
-                record_data_usage(dest_ip_str, dest_port_str, 0, udp_payload_len, 
-                                "ATSC 3.0 LLS (Low Level Signaling)");
+                record_data_usage(dest_ip_str, dest_port_str, 0, pkthdr->caplen, 
+                                "ATSC 3.0 LLS (Low Level Signaling)", &pkthdr->ts, NULL, 0);
                 return;
             }
             
@@ -1209,19 +1554,13 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
                 
                 // Use SLT configuration to determine protocol
                 if (strcmp(dest_info->protocol, "1") == 0) {
-                    // ROUTE protocol
-                    uint32_t tsi = 0;
-                    if (udp_payload_len >= 12) {
-                        tsi = ntohl(*(uint32_t*)(udp_payload + 8));
-                    }
-                    
-                    if (g_packet_count % 50 == 0) {
-                        //printf("DEBUG ROUTE HEADER: Packet %d, TSI=%u from offset 8\n", g_packet_count, tsi);
-                    }
+                    // ROUTE protocol - extract TSI properly from LCT header
+                    uint32_t tsi = get_lct_tsi(udp_payload, udp_payload_len);
+                    if (tsi == 0xFFFFFFFF) tsi = 0;
                     
                     const char* description = get_enhanced_stream_description(dest_ip_str, dest_port_str, 
                                                                             tsi, "ROUTE", 0);
-                    record_data_usage(dest_ip_str, dest_port_str, tsi, udp_payload_len, description);
+                    record_data_usage(dest_ip_str, dest_port_str, tsi, pkthdr->caplen, description, &pkthdr->ts, udp_payload, udp_payload_len);
                     process_route_payload(udp_payload, udp_payload_len, dest_info->destinationIpStr, dest_info->destinationPortStr);
                 } else if (strcmp(dest_info->protocol, "2") == 0) {
                     // MMT protocol  
@@ -1237,14 +1576,54 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
                         description = "MMT Stream";
                     }
                     
-                    record_data_usage(dest_ip_str, dest_port_str, packet_id, udp_payload_len, description);
+                    record_data_usage(dest_ip_str, dest_port_str, packet_id, pkthdr->caplen, description, &pkthdr->ts, udp_payload, udp_payload_len);
                     process_enhanced_mmt_payload(udp_payload, udp_payload_len, dest_info);
                 }
             } else {
-                //printf("DEBUG: No service destination found, using fallback\n");
-                uint32_t tsi_or_packet_id = 0;
-                const char* description = "Unknown UDP Stream";
-                record_data_usage(dest_ip_str, dest_port_str, tsi_or_packet_id, udp_payload_len, description);
+                // No service destination found - need to detect protocol from payload
+                
+                // Check for raw MPEG-TS (starts with 0x47 sync byte)
+                if (udp_payload_len >= 188 && udp_payload[0] == 0x47) {
+                    // Raw MPEG-TS over UDP (not ROUTE encapsulated)
+                    uint16_t pid = ((udp_payload[1] & 0x1F) << 8) | udp_payload[2];
+                    const char* description = (pid == 0x1FFF) ? "MPEG-TS Null" : "MPEG-TS";
+                    record_data_usage(dest_ip_str, dest_port_str, pid, pkthdr->caplen, description, &pkthdr->ts, udp_payload, udp_payload_len);
+                } 
+                // Check for RTP (version 2 in top 2 bits of first byte)
+                else if (udp_payload_len >= 12 && ((udp_payload[0] >> 6) & 0x03) == 2) {
+                    uint8_t payload_type = udp_payload[1] & 0x7F;
+                    // Check if RTP payload is MPEG-TS (starts at byte 12)
+                    if (payload_type == 33 && udp_payload_len >= 15 && udp_payload[12] == 0x47) {
+                        // RTP carrying MPEG-TS
+                        uint16_t pid = ((udp_payload[13] & 0x1F) << 8) | udp_payload[14];
+                        const char* description = (pid == 0x1FFF) ? "RTP/MPEG-TS Null" : "RTP/MPEG-TS";
+                        record_data_usage(dest_ip_str, dest_port_str, pid, pkthdr->caplen, description, &pkthdr->ts, udp_payload, udp_payload_len);
+                    } else {
+                        // Other RTP stream
+                        char description[64];
+                        snprintf(description, sizeof(description), "RTP (PT %d)", payload_type);
+                        record_data_usage(dest_ip_str, dest_port_str, payload_type, pkthdr->caplen, description, &pkthdr->ts, udp_payload, udp_payload_len);
+                    }
+                }
+                // Check for MMT (version 0 in top 2 bits, and reasonable packet structure)
+                else if (udp_payload_len >= 12 && ((udp_payload[0] >> 6) & 0x03) == 0) {
+                    // MMT packet - extract packet_id from bytes 2-3
+                    uint16_t packet_id = ntohs(*(uint16_t*)(udp_payload + 2));
+                    const char* description = "MMT";
+                    record_data_usage(dest_ip_str, dest_port_str, packet_id, pkthdr->caplen, description, &pkthdr->ts, udp_payload, udp_payload_len);
+                }
+                else {
+                    // Assume ROUTE/ALC - extract TSI from LCT header properly
+                    uint32_t tsi = get_lct_tsi(udp_payload, udp_payload_len);
+                    if (tsi == 0xFFFFFFFF) tsi = 0;  // Default on error
+                    
+                    const char* description = get_enhanced_stream_description(dest_ip_str, dest_port_str, 
+                                                                            tsi, "ROUTE", 0);
+                    record_data_usage(dest_ip_str, dest_port_str, tsi, pkthdr->caplen, description, &pkthdr->ts, udp_payload, udp_payload_len);
+                    
+                    // Try processing as ROUTE - this will handle MIME payloads
+                    process_route_payload(udp_payload, udp_payload_len, dest_ip_str, dest_port_str);
+                }
             }
             
         } else if (result == 1 && signaling_payload) {
@@ -1259,9 +1638,13 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
                         "LMT_Version_%d_Services_%d", lmt_data->lmt_version, lmt_data->num_services);
                 
                 store_unique_table(lmt_content_id, strlen(lmt_content_id), 
-                                TABLE_TYPE_LMT, lmt_data, "", "");
+                                TABLE_TYPE_LMT, lmt_data, "", "", 0, -1);
             }
             
+        } else if (result == 2) {
+            // ALP Extension/Stuffing packet
+            record_data_usage("N/A", "N/A", 0, pkthdr->caplen, 
+                            "ALP Stuffing/Extension", &pkthdr->ts, NULL, 0);
         } /*else {
             printf("DEBUG: Could not parse ALP packet %d (result=%d)\n", g_packet_count, result);
         }*/
@@ -1287,19 +1670,21 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
 
     ip_header = (struct ip*)ip_packet_start;
     if (!ip_header) {
-        printf("DEBUG: NULL ip_header at packet %d\n", g_packet_count);
         return;
     }
     
     ip_header_len = ip_header->ip_hl * 4;
 
     if (ip_header->ip_p != IPPROTO_UDP) {
+        char dest_ip_str[40];
+        inet_ntop(AF_INET, &ip_header->ip_dst, dest_ip_str, sizeof(dest_ip_str));
+        record_data_usage(dest_ip_str, "N/A", 0, pkthdr->caplen, 
+                    "ALP Non-UDP IP (Stuffing)", &pkthdr->ts, NULL, 0);
         return;
     }
 
     udp_header = (struct udphdr*)((u_char*)ip_header + ip_header_len);
     if (!udp_header) {
-        printf("DEBUG: NULL udp_header at packet %d\n", g_packet_count);
         return;
     }
     
@@ -1321,7 +1706,7 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
     if (is_lls) {
         process_lls_payload(payload, payload_len);
         record_data_usage(dest_ip_str, dest_port_str, 0, payload_len, 
-                         "ATSC 3.0 LLS (Low Level Signaling)");
+                         "ATSC 3.0 LLS (Low Level Signaling)", &pkthdr->ts, NULL, 0);
         return;
     }
     
@@ -1343,19 +1728,13 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
         
         // Use SLT configuration to determine protocol
         if (strcmp(dest_info->protocol, "1") == 0) {
-            // ROUTE protocol
-            uint32_t tsi = 0;
-            if (payload_len >= 12) {  // Need at least 12 bytes now
-                tsi = ntohl(*(uint32_t*)(payload + 8));  // CHANGED: offset 8 instead of 4
-            }
-            
-            if (g_packet_count % 50 == 0) {
-                //printf("DEBUG ROUTE HEADER: Packet %d, TSI=%u from offset 8\n", g_packet_count, tsi);
-            }
+            // ROUTE protocol - extract TSI properly from LCT header
+            uint32_t tsi = get_lct_tsi(payload, payload_len);
+            if (tsi == 0xFFFFFFFF) tsi = 0;
             
             const char* description = get_enhanced_stream_description(dest_ip_str, dest_port_str, 
                                                                     tsi, "ROUTE", 0);
-            record_data_usage(dest_ip_str, dest_port_str, tsi, payload_len, description);
+            record_data_usage(dest_ip_str, dest_port_str, tsi, payload_len, description, &pkthdr->ts, payload, payload_len);
             process_route_payload(payload, payload_len, dest_info->destinationIpStr, dest_info->destinationPortStr);
         } else if (strcmp(dest_info->protocol, "2") == 0) {
             // MMT protocol  
@@ -1371,18 +1750,55 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char
                 description = "MMT Stream";
             }
             
-            record_data_usage(dest_ip_str, dest_port_str, packet_id, payload_len, description);
+            record_data_usage(dest_ip_str, dest_port_str, packet_id, payload_len, description, &pkthdr->ts, payload, payload_len);
             printf("DEBUG: About to call process_enhanced_mmt_payload with dest_info=%p\n", dest_info);
             process_enhanced_mmt_payload(payload, payload_len, dest_info);
         }
     } else {
-        //printf("DEBUG: No service destination found, using fallback\n");
-        // Use the original fallback logic temporarily
-        uint32_t tsi_or_packet_id = 0;
+        // No service destination found - need to detect protocol from payload
         
-        // Skip the protocol detection for now to avoid crashes
-        const char* description = "Unknown UDP Stream";
-        record_data_usage(dest_ip_str, dest_port_str, tsi_or_packet_id, payload_len, description);
+        // Check for raw MPEG-TS (starts with 0x47 sync byte)
+        if (payload_len >= 188 && payload[0] == 0x47) {
+            // Raw MPEG-TS over UDP (not ROUTE encapsulated)
+            uint16_t pid = ((payload[1] & 0x1F) << 8) | payload[2];
+            const char* description = (pid == 0x1FFF) ? "MPEG-TS Null" : "MPEG-TS";
+            record_data_usage(dest_ip_str, dest_port_str, pid, payload_len, description, &pkthdr->ts, payload, payload_len);
+        } 
+        // Check for RTP (version 2 in top 2 bits of first byte)
+        else if (payload_len >= 12 && ((payload[0] >> 6) & 0x03) == 2) {
+            uint8_t payload_type = payload[1] & 0x7F;
+            // Check if RTP payload is MPEG-TS (starts at byte 12)
+            if (payload_type == 33 && payload_len >= 15 && payload[12] == 0x47) {
+                // RTP carrying MPEG-TS
+                uint16_t pid = ((payload[13] & 0x1F) << 8) | payload[14];
+                const char* description = (pid == 0x1FFF) ? "RTP/MPEG-TS Null" : "RTP/MPEG-TS";
+                record_data_usage(dest_ip_str, dest_port_str, pid, payload_len, description, &pkthdr->ts, payload, payload_len);
+            } else {
+                // Other RTP stream
+                char description[64];
+                snprintf(description, sizeof(description), "RTP (PT %d)", payload_type);
+                record_data_usage(dest_ip_str, dest_port_str, payload_type, payload_len, description, &pkthdr->ts, payload, payload_len);
+            }
+        }
+        // Check for MMT (version 0 in top 2 bits)
+        else if (payload_len >= 12 && ((payload[0] >> 6) & 0x03) == 0) {
+            // MMT packet - extract packet_id from bytes 2-3
+            uint16_t packet_id = ntohs(*(uint16_t*)(payload + 2));
+            const char* description = "MMT";
+            record_data_usage(dest_ip_str, dest_port_str, packet_id, payload_len, description, &pkthdr->ts, payload, payload_len);
+        }
+        else {
+            // Assume ROUTE/ALC - extract TSI from LCT header properly
+            uint32_t tsi = get_lct_tsi(payload, payload_len);
+            if (tsi == 0xFFFFFFFF) tsi = 0;  // Default on error
+            
+            const char* description = get_enhanced_stream_description(dest_ip_str, dest_port_str, 
+                                                                      tsi, "ROUTE", 0);
+            record_data_usage(dest_ip_str, dest_port_str, tsi, payload_len, description, &pkthdr->ts, payload, payload_len);
+            
+            // Try processing as ROUTE - this will handle MIME payloads
+            process_route_payload(payload, payload_len, dest_ip_str, dest_port_str);
+        }
     }
     
     //printf("DEBUG: Packet %d complete\n", g_packet_count);
@@ -1481,14 +1897,14 @@ int is_likely_route_packet(const uint8_t* payload, int len) {
     if (len < 8) return 0;
     
     // Check for LCT header patterns
-    // LCT version should be 1, and header should have reasonable length
-    uint8_t version = (payload[0] >> 6) & 0x3;
+    // LCT version should be 1 (top 4 bits of byte 0)
+    uint8_t version = (payload[0] >> 4) & 0x0F;
     uint8_t hdr_len = payload[2]; // Header length in 32-bit words
     
     if (version == 1 && hdr_len >= 2 && hdr_len <= 16) {
         // Check if TSI field looks reasonable (usually 0-255 for signaling/media)
-        uint32_t tsi = ntohl(*(uint32_t*)(payload + 4));
-        if (tsi <= 1000) { // Reasonable TSI range
+        uint32_t tsi = get_lct_tsi(payload, len);
+        if (tsi != 0xFFFFFFFF && tsi <= 1000) { // Reasonable TSI range
             return 1;
         }
     }
@@ -1636,6 +2052,8 @@ const char* get_extended_stream_description(const char* dest_ip, const char* des
 }
 
 const char* get_service_name_for_destination(const char* dest_ip, const char* dest_port) {
+    static char udst_name_buffer[128];
+    
     // Special case for LLS
     if (strcmp(dest_ip, "224.0.23.60") == 0 && strcmp(dest_port, "4937") == 0) {
         return "LLS Signaling";
@@ -1660,7 +2078,129 @@ const char* get_service_name_for_destination(const char* dest_ip, const char* de
             }
         }
     }
+    
+    // Look through UDST entries for BroadSpan services and simple UDS
+    for (int i = 0; i < g_lls_table_count; i++) {
+        if (g_lls_tables[i].type == TABLE_TYPE_UDST) {
+            UdstData* udst_data = (UdstData*)g_lls_tables[i].parsed_data;
+            if (!udst_data) continue;
+            
+            // Check simple UDS entries
+            UdsData* uds = udst_data->head_uds;
+            while (uds) {
+                if (strcmp(uds->destIP, dest_ip) == 0 && strcmp(uds->destPort, dest_port) == 0) {
+                    if (uds->name[0]) {
+                        return uds->name;
+                    } else if (uds->contextId[0]) {
+                        return uds->contextId;
+                    }
+                }
+                uds = uds->next;
+            }
+            
+            // Check BroadSpan services
+            BroadSpanServiceInfo* bss = udst_data->head_service;
+            while (bss) {
+                RsrvInfo* rsrv = bss->head_rsrv;
+                if (rsrv && strcmp(rsrv->destIP, dest_ip) == 0 && strcmp(rsrv->destPort, dest_port) == 0) {
+                    // Return a shortened version of the service name
+                    if (bss->name[0]) {
+                        // Extract just the meaningful part (e.g., "RTK" from the full gsid)
+                        const char* type_start = strstr(bss->name, "(");
+                        if (type_start) {
+                            // Name already has type appended like "tag:... (RTK)"
+                            snprintf(udst_name_buffer, sizeof(udst_name_buffer), "BroadSpan %s", type_start);
+                        } else {
+                            snprintf(udst_name_buffer, sizeof(udst_name_buffer), "BroadSpan: %.100s", bss->name);
+                        }
+                        return udst_name_buffer;
+                    }
+                }
+                bss = bss->next;
+            }
+        }
+    }
+    
+    // Look through standalone UDS tables
+    for (int i = 0; i < g_lls_table_count; i++) {
+        if (g_lls_tables[i].type == TABLE_TYPE_UDS) {
+            UdsData* uds = (UdsData*)g_lls_tables[i].parsed_data;
+            if (uds && strcmp(uds->destIP, dest_ip) == 0 && strcmp(uds->destPort, dest_port) == 0) {
+                if (uds->name[0]) {
+                    return uds->name;
+                } else if (uds->contextId[0]) {
+                    return uds->contextId;
+                }
+            }
+        }
+    }
+    
     return NULL;
+}
+
+/**
+ * @brief Extracts the TSI from an LCT header.
+ * 
+ * ATSC 3.0 ROUTE (per A/331) uses a standard LCT header layout with:
+ * - 4 bytes fixed header
+ * - 4 bytes CCI (Congestion Control Information)  
+ * - 4 bytes TSI (Transport Session Identifier) at offset 8
+ * - 4 bytes TOI (Transport Object Identifier) at offset 12
+ *
+ * Some non-standard streams may omit CCI, putting TSI at offset 4.
+ * We detect this by checking if the value at offset 4 is 0 (CCI) vs a valid TSI.
+ *
+ * @return TSI value, or 0xFFFFFFFF on error
+ */
+uint32_t get_lct_tsi(const u_char* payload, int len) {
+    if (len < 12) return 0xFFFFFFFF;
+    
+    // Verify this looks like an LCT header (version should be 1)
+    uint8_t version = (payload[0] >> 4) & 0x0F;
+    if (version != 1) return 0xFFFFFFFF;
+    
+    // Standard ATSC 3.0 layout: TSI at offset 8
+    // Check if offset 4-7 looks like CCI (typically 0) or TSI
+    uint32_t val_at_4 = ntohl(*(uint32_t*)(payload + 4));
+    uint32_t val_at_8 = ntohl(*(uint32_t*)(payload + 8));
+    
+    // If value at offset 4 is 0, it's likely CCI and TSI is at offset 8
+    // If value at offset 8 is 0, TSI might be at offset 4 (non-standard)
+    if (val_at_4 == 0) {
+        // Standard ATSC 3.0: CCI=0 at offset 4, TSI at offset 8
+        return val_at_8;
+    } else if (val_at_8 == 0 || val_at_4 <= 1000) {
+        // Non-standard: no CCI, TSI at offset 4
+        // (TSI values are typically small, 0-1000)
+        return val_at_4;
+    } else {
+        // Default to standard layout
+        return val_at_8;
+    }
+}
+
+/**
+ * @brief Extracts the TOI from an LCT header.
+ * 
+ * ATSC 3.0 standard layout: TOI at offset 12.
+ * Non-standard (no CCI): TOI at offset 8.
+ */
+uint32_t get_lct_toi(const u_char* payload, int len) {
+    if (len < 16) return 0xFFFFFFFF;
+    
+    // Use same heuristic as get_lct_tsi to determine layout
+    uint32_t val_at_4 = ntohl(*(uint32_t*)(payload + 4));
+    
+    if (val_at_4 == 0) {
+        // Standard ATSC 3.0: CCI=0 at offset 4, TOI at offset 12
+        return ntohl(*(uint32_t*)(payload + 12));
+    } else if (val_at_4 <= 1000) {
+        // Non-standard: no CCI, TOI at offset 8
+        return ntohl(*(uint32_t*)(payload + 8));
+    } else {
+        // Default to standard layout
+        return ntohl(*(uint32_t*)(payload + 12));
+    }
 }
 
 /**
@@ -1695,13 +2235,12 @@ uint16_t get_route_payload_offset(const u_char* payload, int len) {
 
     // The FEC Payload ID is only present for ROUTE/ALC. For TSI=0 (signaling),
     // it consists of a 4-byte field.
-    uint16_t fec_payload_id_len = 0;
-    if (len >= 8) { // Need at least 8 bytes to read TSI
-        uint32_t tsi = ntohl(*(uint32_t*)(payload + 4));
-        if (tsi == 0) {
-            fec_payload_id_len = 4;
-        }
-    }
+    /*uint16_t fec_payload_id_len = 0;
+    uint32_t tsi = get_lct_tsi(payload, len);
+    if (tsi == 0) {
+        fec_payload_id_len = 4;
+    }*/
+    uint16_t fec_payload_id_len = 4;
 
     uint16_t total_offset = lct_header_len + fec_payload_id_len;
     
@@ -1724,6 +2263,19 @@ int is_esg_service(const char* destIp, const char* destPort) {
         }
     }
     //printf("DEBUG ESG CHECK: Service not found in g_service_dests\n");
+    return 0;
+}
+
+/**
+ * @brief Check if a destination is an eGPS service
+ */
+int is_egps_service(const char* destIp, const char* destPort) {
+    for(int i = 0; i < g_service_dest_count; i++) {
+        if(strcmp(g_service_dests[i].destinationIpStr, destIp) == 0 &&
+           strcmp(g_service_dests[i].destinationPortStr, destPort) == 0) {
+            return g_service_dests[i].isEgpsService;
+        }
+    }
     return 0;
 }
 
@@ -1904,6 +2456,24 @@ int normalize_xml_content(const char* xml_content, char* normalized_buffer, size
             }
         } else {
             break;
+        }
+    }
+    
+    // For S-TSID: normalize startTime attribute (changes every second)
+    if (strstr(normalized_buffer, "<S-TSID") || strstr(normalized_buffer, "<RS ")) {
+        pos = normalized_buffer;
+        while ((pos = strstr(pos, "startTime=\"")) != NULL) {
+            pos += 11; // Skip 'startTime="'
+            char* end_quote = strchr(pos, '"');
+            if (end_quote) {
+                // Replace timestamp with X's
+                while (pos < end_quote) {
+                    *pos = 'X';
+                    pos++;
+                }
+            } else {
+                break;
+            }
         }
     }
     
@@ -2097,8 +2667,6 @@ void remove_functionally_duplicate_tables() {
             }
             
             if (is_functionally_equivalent(g_lls_tables[i].content_id, g_lls_tables[j].content_id)) {
-                printf("DEBUG DEDUP: Found functionally equivalent tables at i=%d, j=%d, type=%d\n", 
-                        i, j, g_lls_tables[i].type);
                 // Determine which one to keep (prefer more recent timestamp if available)
                 int remove_index = i; // Default: keep the NEWER one (j), remove the older (i)
                 
@@ -2119,33 +2687,18 @@ void remove_functionally_duplicate_tables() {
                 
                 // For S-TSID documents, keep the one with higher efdtVersion
                 if (g_lls_tables[i].type == TABLE_TYPE_STSID) {
-                    printf("DEBUG DEDUP STSID: Comparing i=%d (%s:%s) with j=%d (%s:%s)\n",
-                        i, g_lls_tables[i].destinationIp, g_lls_tables[i].destinationPort,
-                        j, g_lls_tables[j].destinationIp, g_lls_tables[j].destinationPort);
-                    printf("DEBUG DEDUP STSID: Comparing versions\n");
                     char* ver1 = strstr(g_lls_tables[i].content_id, "afdt:efdtVersion=\"");
                     char* ver2 = strstr(g_lls_tables[j].content_id, "afdt:efdtVersion=\"");
-                    
-                    printf("DEBUG DEDUP STSID: ver1=%p, ver2=%p\n", (void*)ver1, (void*)ver2);
                     
                     if (ver1 && ver2) {
                         int version1 = atoi(ver1 + 18);
                         int version2 = atoi(ver2 + 18);
                         
-                        printf("DEBUG DEDUP STSID: version1=%d, version2=%d\n", version1, version2);
-                        
                         if (version1 > version2) {
                             remove_index = j;
-                            printf("DEBUG DEDUP STSID: Keeping i (version %d), removing j (version %d)\n", 
-                                version1, version2);
-                        } else {
-                            printf("DEBUG DEDUP STSID: Keeping j (version %d), removing i (version %d)\n", 
-                                version2, version1);
                         }
                     }
                 }
-                
-                printf("DEBUG DEDUP: Removing index %d\n", remove_index);
                 
                 // For metadataEnvelope, try to keep the one with higher version
                 if (g_lls_tables[i].type == TABLE_TYPE_SERVICE_SIGNALING) {
@@ -2211,37 +2764,32 @@ void remove_functionally_duplicate_tables() {
 void process_route_payload(const u_char* payload, int len, const char* destIp, const char* destPort) {
     if (len < 16) return; 
 
-    uint32_t tsi = ntohl(*(uint32_t*)(payload + 8));
-    uint32_t toi = ntohl(*(uint32_t*)(payload + 12));
+    uint32_t tsi = get_lct_tsi(payload, len);
+    uint32_t toi = get_lct_toi(payload, len);
     
-    if (strcmp(destIp, "239.255.57.1") == 0 && strcmp(destPort, "8571") == 0 && toi == 459246) {
-        static int packet_count_459246 = 0;
-        packet_count_459246++;
-        if (packet_count_459246 <= 5) {  // Only log first 5 packets
-            printf("DEBUG WCVW TOI 459246: Packet %d, len=%d, TSI=%u\n", packet_count_459246, len, tsi);
-            printf("  Close object flag: %d, Close session flag: %d\n", 
-                   (payload[1] & 0x01), (payload[1] & 0x02) >> 1);
-        }
-    }
+    // Handle extraction errors
+    if (tsi == 0xFFFFFFFF) tsi = 0;
+    if (toi == 0xFFFFFFFF) toi = 0;
     
-    int is_debug_toi = (strcmp(destIp, "239.255.0.255") == 0 && 
-                        strcmp(destPort, "8000") == 0 && 
-                        toi == 196810);
-    
-    if (is_debug_toi) {
-        g_route_packet_count_196810++;
-        printf("\n=== ROUTE PACKET #%d for TOI=%u ===\n", g_route_packet_count_196810, toi);
-        printf("Packet length: %d bytes\n", len);
-        printf("TSI: %u, TOI: %u\n", tsi, toi);
-        printf("LCT header bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n", 
-               payload[0], payload[1], payload[2], payload[3],
-               payload[4], payload[5], payload[6], payload[7]);
-    }
-
     const char* description = get_stream_description(destIp, destPort, tsi);
-    record_data_usage(destIp, destPort, tsi, len, description);
+    (void)description;  // May be unused
     
-    if (tsi != 0 && !is_esg_service(destIp, destPort)) {
+    // ADD THIS DEBUG - shows ALL packets before filtering:
+    if (tsi == 2) {
+        int close_obj = (payload[1] & 0x01);
+        int close_sess = (payload[1] & 0x02) >> 1;
+        printf("DEBUG TSI2 PACKET: TOI=%u, close_obj=%d, close_sess=%d, len=%d\n", 
+               toi, close_obj, close_sess, len);
+        uint16_t hdr_len = payload[2] * 4;
+        uint32_t b_off = 0;
+        if (len > hdr_len + 4) {
+            b_off = ntohl(*(uint32_t*)(payload + hdr_len));
+        }
+        printf("DEBUG TSI2 PACKET: TOI=%u, close_obj=%d, byte_offset=%u, pkt_len=%d\n", 
+            toi, close_obj, b_off, len);
+    }
+    
+    if (tsi != 0 && !is_esg_service(destIp, destPort) && !is_egps_service(destIp, destPort)) {
         return;
     }
 
@@ -2261,9 +2809,9 @@ void process_route_payload(const u_char* payload, int len, const char* destIp, c
     if (len > header_len + 4) {
         byte_offset = ntohl(*(uint32_t*)(payload + header_len));
         
-        if (is_esg_service(destIp, destPort) && toi >= 5290 && toi <= 5300) {
-            printf("DEBUG FEC: Read byte offset %u (0x%08x) from position %d\n", 
-                byte_offset, byte_offset, header_len);
+        // Sanity check - signaling objects shouldn't be > 10MB
+        if (byte_offset > 10 * 1024 * 1024) {
+            return;
         }
     }
 
@@ -2291,10 +2839,6 @@ void process_route_payload(const u_char* payload, int len, const char* destIp, c
         current_buf->destinationPort[sizeof(current_buf->destinationPort) - 1] = '\0';
         current_buf->next = g_reassembly_head;
         g_reassembly_head = current_buf;
-        
-        if (is_debug_toi) {
-            printf("CREATED NEW BUFFER for TOI=%u\n", toi);
-        }
     }
 
     const u_char* data_to_copy = payload + payload_offset;
@@ -2334,45 +2878,40 @@ void process_route_payload(const u_char* payload, int len, const char* destIp, c
         }
         printf("\n");
         printf("  Buffer start (first 16 bytes): ");
-        for (int i = 0; i < 16 && i < current_buf->size; i++) {
+        for (int i = 0; i < 16 && i < (int)current_buf->size; i++) {
             printf("%02x ", current_buf->buffer[i]);
         }
         printf("\n");
     }
-    
-    if (is_debug_toi) {
-        printf("WROTE %d bytes at byte offset %u. Buffer size now: %zu\n", 
-               len_to_copy, byte_offset, current_buf->size);
-        
-        // Show what the data looks like at this offset
-        printf("Data at offset (first 50 bytes): ");
-        for (int i = 0; i < 50 && i < len_to_copy; i++) {
-            char c = data_to_copy[i];
-            printf("%c", (c >= 32 && c < 127) ? c : '.');
-        }
-        printf("\n");
-    }
 
-    if (close_object_flag || close_session_flag) {
-        if (is_debug_toi) {
-            printf("CLOSE FLAG SET - Processing complete object (%zu bytes)\n", current_buf->size);
+if (close_object_flag || close_session_flag) {
+        // Don't complete if buffer appears incomplete (starts with zeros and we expect more)
+        int looks_incomplete = 0;
+        if (current_buf->size > 100) {
+            // Check if first 16 bytes are all zeros (missed start of object)
+            int all_zeros = 1;
+            for (int i = 0; i < 16 && i < (int)current_buf->size; i++) {
+                if (current_buf->buffer[i] != 0) {
+                    all_zeros = 0;
+                    break;
+                }
+            }
+            if (all_zeros && byte_offset > 0) {
+                looks_incomplete = 1;
+                printf("DEBUG: Skipping incomplete TOI=%u (missed start, first data at offset %u)\n", 
+                    toi, byte_offset);
+            }
         }
         
-        if (strcmp(destIp, "239.255.57.1") == 0 && strcmp(destPort, "8571") == 0) {
-            printf("DEBUG WCVW: Processing complete object for WCVW service\n");
-            printf("            TOI=%u, TSI=%u, Size=%zu bytes\n", toi, tsi, current_buf->size);
-            printf("            First 200 bytes: ");
-            for (int i = 0; i < 200 && i < current_buf->size; i++) {
-                char c = current_buf->buffer[i];
-                printf("%c", (c >= 32 && c < 127) ? c : '.');
-            }
-            printf("\n");
+        if (looks_incomplete) {
+            // Don't process or free - wait for next carousel cycle to fill in the start
+            return;
         }
         
         if (is_esg_service(destIp, destPort)) {
             printf("DEBUG ESG REASSEMBLY: TOI=%u complete, size=%zu\n", toi, current_buf->size);
             printf("First 16 bytes: ");
-            for (int i = 0; i < 16 && i < current_buf->size; i++) {
+            for (int i = 0; i < 16 && i < (int)current_buf->size; i++) {
                 printf("%02x ", current_buf->buffer[i]);
             }
             printf("\n");
@@ -2410,8 +2949,25 @@ void process_route_payload(const u_char* payload, int len, const char* destIp, c
             }
         }
         
+        // Debug logging for eGPS service
+        if (is_egps_service(destIp, destPort)) {
+            printf("DEBUG eGPS REASSEMBLY: TOI=%u complete at %s:%s, size=%zu\n", 
+                   toi, destIp, destPort, current_buf->size);
+            printf("First 16 bytes: ");
+            for (int i = 0; i < 16 && i < (int)current_buf->size; i++) {
+                printf("%02x ", current_buf->buffer[i]);
+            }
+            printf("\n");
+            
+            // Check for Cambium magic
+            if (current_buf->size >= 2 && 
+                current_buf->buffer[0] == 0xBC && current_buf->buffer[1] == 0xA1) {
+                printf("DEBUG eGPS: Found Cambium 0xBCA1 magic in reassembled object!\n");
+            }
+        }
+        
         if (current_buf->size < 10) {
-            printf("WARN: Buffer too small (%zu bytes), discarding\n", current_buf->size);
+            // Buffer too small, discard silently
         } else {
             process_and_store_route_object(current_buf->toi, current_buf->buffer, current_buf->size, 
                                         current_buf->destinationIp, current_buf->destinationPort);
@@ -2584,6 +3140,29 @@ int is_xml_complete(const char* buffer, size_t size) {
  * @brief Enhanced terminal payload processor with better ESG handling
  */
 void process_terminal_payload(uint32_t toi, const uint8_t* buffer, size_t size, const char* destIp, const char* destPort, int is_mmt, uint16_t packet_id) {
+    // Check for eGPS binary data (Cambium-style packets with 0xBCA1 magic)
+    if (size >= 8 && buffer[0] == 0xBC && buffer[1] == 0xA1) {
+        printf("DEBUG eGPS: Found Cambium magic 0xBCA1 in TOI=%u at %s:%s, size=%zu\n", 
+               toi, destIp, destPort, size);
+        
+        // Parse the eGPS packet(s)
+        EgpsData* egps = parse_egps_stream(buffer, size, destIp, destPort);
+        if (egps && egps->location_fix_count > 0) {
+            printf("DEBUG eGPS: Parsed %d location fix(es)\n", egps->location_fix_count);
+            
+            if (store_egps_data(egps)) {
+                printf("DEBUG eGPS: Stored eGPS data for %s:%s\n", destIp, destPort);
+            } else {
+                printf("DEBUG eGPS: No space for more eGPS streams\n");
+                free_egps_data(egps);
+            }
+        } else if (egps) {
+            printf("DEBUG eGPS: No valid fixes parsed from packet\n");
+            free_egps_data(egps);
+        }
+        return;  // Don't process as XML
+    }
+    
     if (is_esg_service(destIp, destPort) && toi > 0) {
         printf("DEBUG ESG TERMINAL: Processing TOI=%u payload, size=%zu\n", toi, size);
         
@@ -2711,7 +3290,7 @@ void process_terminal_payload(uint32_t toi, const uint8_t* buffer, size_t size, 
                         if (type == TABLE_TYPE_ESG_FRAGMENT) {
                             printf("DEBUG ESG STORE: Storing ESG fragment for %s:%s\n", destIp, destPort);
                         }
-                        store_unique_table(decompressed_xml, decompressed_size, type, parsed_data, destIp, destPort);
+                        store_unique_table(decompressed_xml, decompressed_size, type, parsed_data, destIp, destPort, 0, -1);
                         
                         printf("DEBUG ESG SUCCESS: Successfully parsed TOI=%u as XML type %d\n", toi, type);
                     } else {
@@ -2735,7 +3314,7 @@ void process_terminal_payload(uint32_t toi, const uint8_t* buffer, size_t size, 
                 void* parsed_data = NULL;
                 
                 if (parse_xml(decompressed_xml, decompressed_size, &type, &parsed_data, source_id) == 0 && parsed_data) {
-                    store_unique_table(decompressed_xml, decompressed_size, type, parsed_data, destIp, destPort);
+                    store_unique_table(decompressed_xml, decompressed_size, type, parsed_data, destIp, destPort, 0, -1);
                 }
             }
             
@@ -2805,7 +3384,7 @@ void process_terminal_payload(uint32_t toi, const uint8_t* buffer, size_t size, 
         void* parsed_data = NULL;
         if (parse_xml((const char*)buffer, size, &type, &parsed_data, source_id) == 0) {
             if(parsed_data) {
-                store_unique_table((const char*)buffer, size, type, parsed_data, destIp, destPort);
+                store_unique_table((const char*)buffer, size, type, parsed_data, destIp, destPort, 0, -1);
                 
                 if (is_esg_service(destIp, destPort)) {
                     printf("DEBUG ESG SUCCESS: Successfully parsed plain TOI=%u as XML type %d\n", toi, type);
@@ -2823,6 +3402,7 @@ void process_terminal_payload(uint32_t toi, const uint8_t* buffer, size_t size, 
 
 /**
  * @brief Parses a reassembled MIME object.
+ * Updated to handle nested MIME structures (e.g. multipart/signed containing multipart/related).
  */
 void process_mime_object(uint32_t toi, const uint8_t* buffer, size_t size, const char* boundary_str, const char* destIp, const char* destPort) {
     if (is_esg_service(destIp, destPort)) {
@@ -2837,7 +3417,6 @@ void process_mime_object(uint32_t toi, const uint8_t* buffer, size_t size, const
     const uint8_t* final_marker = memmem(buffer, size, final_boundary, strlen(final_boundary));
     if (!final_marker) {
         printf("WARN: MIME object missing final boundary marker, may be incomplete\n");
-        // Continue anyway but be cautious
     }
     
     const uint8_t* current_pos = buffer;
@@ -2888,36 +3467,82 @@ void process_mime_object(uint32_t toi, const uint8_t* buffer, size_t size, const
         size_t part_len = part_end - headers_start;
         
         // Find the blank line that separates headers from content
-        const char* header_sep = "\r\n\r\n";
-        const uint8_t* payload_start = memmem(headers_start, part_len, header_sep, strlen(header_sep));
+        // Try standard CRLF first, then handle \r\r\n variant  
+        const uint8_t* payload_start = memmem(headers_start, part_len, "\r\n\r\n", 4);
+        size_t header_sep_len = 4;
+
+        if (!payload_start) {
+            payload_start = memmem(headers_start, part_len, "\r\r\n\r\r\n", 6);
+            header_sep_len = 6;
+        }
 
         if(payload_start) {
-            payload_start += strlen(header_sep);
+            // Calculate header length before advancing payload pointer
+            size_t headers_len = payload_start - headers_start;
+
+            payload_start += header_sep_len;
             size_t payload_len = part_end - payload_start;
             
             if (payload_len > 0) {
                 part_count++;
                 
-                // Validate this looks like valid XML before processing
-                int looks_valid = 0;
-                if (payload_len > 5) {
-                    if (memcmp(payload_start, "<?xml", 5) == 0 ||
-                        memcmp(payload_start, "<S-TSID", 7) == 0 ||
-                        memcmp(payload_start, "<MPD", 4) == 0 ||
-                        memcmp(payload_start, "<FDT-", 5) == 0 ||
-                        memcmp(payload_start, "<HELD", 5) == 0) {
-                        looks_valid = 1;
+                // --- NEW: Check headers for nested multipart ---
+                int is_nested = 0;
+                char nested_boundary[256] = "";
+
+                // Make a temporary null-terminated copy of headers for easier string searching
+                char* headers_copy = malloc(headers_len + 1);
+                if (headers_copy) {
+                    memcpy(headers_copy, headers_start, headers_len);
+                    headers_copy[headers_len] = '\0';
+                    
+                    // Check for Content-Type: multipart/...
+                    if (strcasestr(headers_copy, "Content-Type") && strcasestr(headers_copy, "multipart/")) {
+                        char* b_ptr = strcasestr(headers_copy, "boundary=");
+                        if (b_ptr) {
+                            b_ptr += 9; // skip "boundary="
+                            if (*b_ptr == '"') b_ptr++; // skip quote if present
+                            
+                            char* b_end = strpbrk(b_ptr, "\";\r\n"); // Find end of token
+                            if (b_end && b_end > b_ptr) {
+                                size_t b_len = b_end - b_ptr;
+                                if (b_len < 200) {
+                                    // MIME boundaries used in the body must be prefixed with "--"
+                                    snprintf(nested_boundary, sizeof(nested_boundary), "--%.*s", (int)b_len, b_ptr);
+                                    is_nested = 1;
+                                }
+                            }
+                        }
+                    }
+                    free(headers_copy);
+                }
+
+                if (is_nested) {
+                    printf("DEBUG MIME: Found nested multipart in part %d, recursing with boundary: %s\n", part_count, nested_boundary);
+                    process_mime_object(toi, payload_start, payload_len, nested_boundary, destIp, destPort);
+                } else {
+                    // Standard leaf processing (XML, etc.)
+                    // Validate this looks like valid XML before processing
+                    int looks_valid = 0;
+                    if (payload_len > 5) {
+                        if (memcmp(payload_start, "<?xml", 5) == 0 ||
+                            memcmp(payload_start, "<S-TSID", 7) == 0 ||
+                            memcmp(payload_start, "<MPD", 4) == 0 ||
+                            memcmp(payload_start, "<FDT-", 5) == 0 ||
+                            memcmp(payload_start, "<HELD", 5) == 0 ||
+                            // Also accept if it has Content- headers (sometimes stripped but good safety)
+                            memcmp(payload_start, "Content-", 8) == 0) {
+                            looks_valid = 1;
+                        }
+                    }
+                    
+                    if (!looks_valid) {
+                        printf("WARN MIME: Part %d doesn't look like valid XML, skipping\n", part_count);
+                        // Fall through to update current_pos
+                    } else {
+                        process_terminal_payload(toi, payload_start, payload_len, destIp, destPort, 0, 0);
                     }
                 }
-                
-                if (!looks_valid) {
-                    printf("WARN MIME: Part %d doesn't look like valid XML, skipping\n", part_count);
-                    current_pos = next_boundary_loc;
-                    remaining_size = size - (current_pos - buffer);
-                    continue;
-                }
-                
-                process_terminal_payload(toi, payload_start, payload_len, destIp, destPort, 0, 0);
             }
         } else {
             printf("WARNING MIME: Could not find header separator for part %d\n", part_count + 1);
@@ -2955,7 +3580,8 @@ void process_and_store_route_object(uint32_t toi, const uint8_t* buffer, size_t 
         // Check if it starts with typical MIME headers
         if (memcmp(buffer, "Content-Type:", 13) == 0 ||
             memcmp(buffer, "Content-", 8) == 0 ||
-            (size > 100 && memmem(buffer, 100, "multipart/related", 17) != NULL)) {
+            memcmp(buffer, "MIME-Version:", 13) == 0 ||
+            (size > 100 && memmem(buffer, 100, "multipart/", 10) != NULL)) {
             looks_like_mime = 1;
         }
     }
@@ -2967,7 +3593,7 @@ void process_and_store_route_object(uint32_t toi, const uint8_t* buffer, size_t 
         if (multipart_loc) {
             
             const char* boundary_marker = "boundary=\"";
-            const uint8_t* boundary_loc = memmem(buffer, size > 500 ? 500 : size, boundary_marker, strlen(boundary_marker));
+            const uint8_t* boundary_loc = memmem(multipart_loc, size - (multipart_loc - buffer), boundary_marker, strlen(boundary_marker));
             
             if (boundary_loc) {
                 const char* boundary_val_start = (char*)boundary_loc + strlen(boundary_marker);
@@ -3176,15 +3802,98 @@ void reclassify_data_usage_after_slt() {
 }
 
 /**
+ * @brief Detects signature algorithm from CMS signature block
+ * @return SignatureAlgorithm enum value
+ */
+static SignatureAlgorithm detect_signature_algorithm(const uint8_t* data, size_t len) {
+    // Combined signature algorithm OIDs (preferred)
+    // RSA-SHA256 OID: 1.2.840.113549.1.1.11 = 2A 86 48 86 F7 0D 01 01 0B
+    static const uint8_t RSA_SHA256[] = {0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B};
+    // RSA-SHA384 OID: 1.2.840.113549.1.1.12
+    static const uint8_t RSA_SHA384[] = {0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C};
+    // RSA-SHA512 OID: 1.2.840.113549.1.1.13
+    static const uint8_t RSA_SHA512[] = {0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D};
+    // ECDSA-SHA256 OID: 1.2.840.10045.4.3.2 = 2A 86 48 CE 3D 04 03 02
+    static const uint8_t ECDSA_SHA256[] = {0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02};
+    // ECDSA-SHA384 OID: 1.2.840.10045.4.3.3
+    static const uint8_t ECDSA_SHA384[] = {0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03};
+    
+    // Digest algorithm OIDs (used when signature and digest are specified separately)
+    // SHA-256 OID: 2.16.840.1.101.3.4.2.1 = 60 86 48 01 65 03 04 02 01
+    static const uint8_t SHA256_DIGEST[] = {0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01};
+    // SHA-384 OID: 2.16.840.1.101.3.4.2.2
+    static const uint8_t SHA384_DIGEST[] = {0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02};
+    // rsaEncryption OID: 1.2.840.113549.1.1.1 = 2A 86 48 86 F7 0D 01 01 01
+    static const uint8_t RSA_ENCRYPTION[] = {0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01};
+    
+    // Search for OIDs in first 500 bytes (signature algorithms appear early in CMS)
+    size_t search_len = len > 500 ? 500 : len;
+    
+    int found_sha256 = 0, found_sha384 = 0, found_rsa = 0, found_ecdsa = 0;
+    
+    for (size_t i = 0; i < search_len - 10; i++) {
+        // OID tag is 0x06, followed by length byte
+        if (data[i] == 0x06) {
+            uint8_t oid_len = data[i + 1];
+            if (i + 2 + oid_len <= search_len) {
+                // Check combined signature+hash OIDs first (most specific)
+                if (oid_len == 9 && memcmp(&data[i + 2], RSA_SHA256, 9) == 0) return SIG_ALG_RSA_SHA256;
+                if (oid_len == 9 && memcmp(&data[i + 2], RSA_SHA384, 9) == 0) return SIG_ALG_RSA_SHA384;
+                if (oid_len == 9 && memcmp(&data[i + 2], RSA_SHA512, 9) == 0) return SIG_ALG_RSA_SHA512;
+                if (oid_len == 8 && memcmp(&data[i + 2], ECDSA_SHA256, 8) == 0) return SIG_ALG_ECDSA_SHA256;
+                if (oid_len == 8 && memcmp(&data[i + 2], ECDSA_SHA384, 8) == 0) return SIG_ALG_ECDSA_SHA384;
+                
+                // Check separate digest and encryption OIDs
+                if (oid_len == 9 && memcmp(&data[i + 2], SHA256_DIGEST, 9) == 0) found_sha256 = 1;
+                if (oid_len == 9 && memcmp(&data[i + 2], SHA384_DIGEST, 9) == 0) found_sha384 = 1;
+                if (oid_len == 9 && memcmp(&data[i + 2], RSA_ENCRYPTION, 9) == 0) found_rsa = 1;
+                // ecPublicKey OID: 1.2.840.10045.2.1 = 2A 86 48 CE 3D 02 01
+                if (oid_len == 7 && data[i + 2] == 0x2A && data[i + 3] == 0x86 && 
+                    data[i + 4] == 0x48 && data[i + 5] == 0xCE && data[i + 6] == 0x3D) found_ecdsa = 1;
+            }
+        }
+    }
+    
+    // Infer algorithm from separate OIDs
+    if (found_rsa && found_sha256) return SIG_ALG_RSA_SHA256;
+    if (found_rsa && found_sha384) return SIG_ALG_RSA_SHA384;
+    if (found_ecdsa && found_sha256) return SIG_ALG_ECDSA_SHA256;
+    if (found_ecdsa && found_sha384) return SIG_ALG_ECDSA_SHA384;
+    
+    // If we found RSA but no specific hash, assume SHA-256 (most common)
+    if (found_rsa) return SIG_ALG_RSA_SHA256;
+    if (found_ecdsa) return SIG_ALG_ECDSA_SHA256;
+    
+    return SIG_ALG_UNKNOWN;
+}
+
+/**
+ * @brief Gets human-readable name for signature algorithm
+ */
+static const char* get_signature_algorithm_name(SignatureAlgorithm alg) {
+    switch (alg) {
+        case SIG_ALG_RSA_SHA256:   return "RSA-SHA256";
+        case SIG_ALG_RSA_SHA384:   return "RSA-SHA384";
+        case SIG_ALG_RSA_SHA512:   return "RSA-SHA512";
+        case SIG_ALG_ECDSA_SHA256: return "ECDSA-SHA256";
+        case SIG_ALG_ECDSA_SHA384: return "ECDSA-SHA384";
+        default:                   return "Unknown";
+    }
+}
+
+/**
  * @brief Processes the UDP payload of an LLS packet.
+ * Enhanced to track Signed Multi-Table (SMT) containment.
  */
 void process_lls_payload(const u_char *payload, int len) {
-    record_data_usage("224.0.23.60", "4937", 0, len, "ATSC 3.0 LLS (Low Level Signaling)");
-    
     const u_char *payload_start = payload;
     const u_char *current_pos = payload;
     int remaining_len = len;
     int fragments_found = 0;
+    
+    // Track tables extracted from this LLS payload for SMT association
+    int first_table_index = g_lls_table_count;  // Remember where we started
+    int tables_in_this_payload = 0;
 
     while (remaining_len > 10) { 
         const u_char *gzip_header = NULL;
@@ -3209,7 +3918,9 @@ void process_lls_payload(const u_char *payload, int len) {
                     if(type == TABLE_TYPE_SLT) {
                         store_slt_destinations((SltData*)parsed_data);
                     }
-                    store_unique_table(xml_content, decompressed_size, type, parsed_data, NULL, NULL);
+                    // Store with is_in_smt=0 for now - we'll update after checking for signature
+                    store_unique_table(xml_content, decompressed_size, type, parsed_data, NULL, NULL, 0, -1);
+                    tables_in_this_payload++;
                     if(type == TABLE_TYPE_SLT) {
                         store_slt_destinations((SltData*)parsed_data);
                     }
@@ -3227,13 +3938,38 @@ void process_lls_payload(const u_char *payload, int len) {
         }
     }
 
+    // Handle signature block - if present, this was a Signed Multi-Table (SMT)
     if (fragments_found > 0 && remaining_len > 10) {
         SignatureData* sig_data = calloc(1, sizeof(SignatureData));
         if(sig_data) {
             sig_data->signature_len = remaining_len;
+            sig_data->tables_covered = tables_in_this_payload;
+            
+            // Check if this looks like valid CMS (starts with SEQUENCE tag 0x30)
+            sig_data->is_cms_valid = (current_pos[0] == 0x30) ? 1 : 0;
+            
+            // Detect signature algorithm
+            sig_data->algorithm = detect_signature_algorithm(current_pos, remaining_len);
+            strncpy(sig_data->algorithm_name, get_signature_algorithm_name(sig_data->algorithm),
+                    sizeof(sig_data->algorithm_name) - 1);
+            sig_data->algorithm_name[sizeof(sig_data->algorithm_name) - 1] = '\0';
+            
             char sig_id[256];
-            snprintf(sig_id, sizeof(sig_id), "<Signature len=\"%d\"/>", remaining_len);
-            store_unique_table(sig_id, strlen(sig_id), TABLE_TYPE_SIGNATURE, sig_data, NULL, NULL);
+            snprintf(sig_id, sizeof(sig_id), "<Signature len=\"%d\" alg=\"%s\" tables=\"%d\"/>", 
+                     remaining_len, sig_data->algorithm_name, tables_in_this_payload);
+            
+            // Store signature and get its index
+            int sig_index = g_lls_table_count;
+            store_unique_table(sig_id, strlen(sig_id), TABLE_TYPE_SIGNATURE, sig_data, NULL, NULL, 0, -1);
+            
+            // Go back and mark all tables from this SMT as signed
+            for (int i = first_table_index; i < sig_index; i++) {
+                g_lls_tables[i].is_in_smt = 1;
+                g_lls_tables[i].smt_signature_index = sig_index;
+            }
+            
+            printf("DEBUG SMT: Marked %d tables as signed (sig index %d, alg=%s)\n", 
+                   tables_in_this_payload, sig_index, sig_data->algorithm_name);
         }
     }
 
@@ -3244,7 +3980,7 @@ void process_lls_payload(const u_char *payload, int len) {
              if(type == TABLE_TYPE_SLT) {
                 store_slt_destinations((SltData*)parsed_data);
             }
-            store_unique_table((const char*)payload, len, type, parsed_data, NULL, NULL);
+            store_unique_table((const char*)payload, len, type, parsed_data, NULL, NULL, 0, -1);
         }
     }
 }
@@ -3302,6 +4038,48 @@ void store_slt_destinations(SltData* slt_data) {
                 g_service_dests[g_service_dest_count].serviceCategory[sizeof(g_service_dests[0].serviceCategory) - 1] = '\0';
                 g_service_dests[g_service_dest_count].isEsgService = (strcmp(service->serviceCategory, "4") == 0) ? 1 : 0;
                 
+                // Check for eGPS service - typically App-Based Service (category 3) with eGPS indicators
+                // Can be identified by shortServiceName, globalServiceID, or other signaling
+                int is_egps = 0;
+                if (service->shortServiceName[0]) {
+                    // Check for common eGPS service names (case-insensitive)
+                    char name_lower[64];
+                    strncpy(name_lower, service->shortServiceName, sizeof(name_lower) - 1);
+                    name_lower[sizeof(name_lower) - 1] = '\0';
+                    for (int c = 0; name_lower[c]; c++) {
+                        if (name_lower[c] >= 'A' && name_lower[c] <= 'Z') {
+                            name_lower[c] += 32;
+                        }
+                    }
+                    if (strstr(name_lower, "egps") || strstr(name_lower, "gps") || 
+                        strstr(name_lower, "gnss") || strstr(name_lower, "location") ||
+                        strstr(name_lower, "position")) {
+                        is_egps = 1;
+                        printf("DEBUG: Detected eGPS service by name: %s at %s:%s\n",
+                               service->shortServiceName, service->slsDestinationIpAddress, 
+                               service->slsDestinationUdpPort);
+                    }
+                }
+                if (!is_egps && service->globalServiceID[0]) {
+                    char gsid_lower[128];
+                    strncpy(gsid_lower, service->globalServiceID, sizeof(gsid_lower) - 1);
+                    gsid_lower[sizeof(gsid_lower) - 1] = '\0';
+                    for (int c = 0; gsid_lower[c]; c++) {
+                        if (gsid_lower[c] >= 'A' && gsid_lower[c] <= 'Z') {
+                            gsid_lower[c] += 32;
+                        }
+                    }
+                    if (strstr(gsid_lower, "egps") || strstr(gsid_lower, "gps:") ||
+                        strstr(gsid_lower, "gnss") || strstr(gsid_lower, "location")) {
+                        is_egps = 1;
+                        printf("DEBUG: Detected eGPS service by globalServiceID: %s at %s:%s\n",
+                               service->globalServiceID, service->slsDestinationIpAddress,
+                               service->slsDestinationUdpPort);
+                    }
+                }
+                g_service_dests[g_service_dest_count].isEgpsService = is_egps;
+                g_service_dests[g_service_dest_count].egpsContextId[0] = '\0';
+                
                 g_service_dest_count++;
             }
         }
@@ -3312,7 +4090,7 @@ void store_slt_destinations(SltData* slt_data) {
 /**
  * @brief Checks if a table is unique and stores it if so.
  */
-void store_unique_table(const char* content, int len, TableType type, void* parsed_data, const char* destIp, const char* destPort) {
+void store_unique_table(const char* content, int len, TableType type, void* parsed_data, const char* destIp, const char* destPort, int is_in_smt, int smt_sig_index) {
     // Validate completeness for critical table types
     if (type == TABLE_TYPE_MPD || type == TABLE_TYPE_STSID) {
         // Check if content ends properly
@@ -3371,6 +4149,8 @@ void store_unique_table(const char* content, int len, TableType type, void* pars
     }
     new_table->parsed_data = parsed_data;
     new_table->type = type;
+    new_table->is_in_smt = is_in_smt;
+    new_table->smt_signature_index = smt_sig_index;
     if (destIp) {
         strncpy(new_table->destinationIp, destIp, sizeof(new_table->destinationIp) - 1);
         new_table->destinationIp[sizeof(new_table->destinationIp) - 1] = '\0';
@@ -3386,7 +4166,7 @@ void store_unique_table(const char* content, int len, TableType type, void* pars
 
     g_lls_table_count++;
     if (type == TABLE_TYPE_SLT) {
-        printf("Stored new SLT table (total count: %d)\n", g_lls_table_count);
+        printf("Stored new SLT table (total count: %d)%s\n", g_lls_table_count, is_in_smt ? " [SIGNED]" : "");
     }
 }
 
@@ -3419,7 +4199,7 @@ void process_multi_document_xml(const char* xml_data, size_t size, const char* d
             TableType type = TABLE_TYPE_UNKNOWN;
             void* parsed_data = NULL;
             if (parse_xml(next_doc, doc_len, &type, &parsed_data, source_id) == 0 && parsed_data) {
-                store_unique_table(next_doc, doc_len, type, parsed_data, destIp, destPort);
+                store_unique_table(next_doc, doc_len, type, parsed_data, destIp, destPort, 0, -1);
             }
         }
         
@@ -3464,6 +4244,10 @@ int parse_xml(const char* xml_content, int len, TableType* type, void** parsed_d
     } else if (xmlStrcmp(root->name, (const xmlChar *)"SystemTime") == 0) {
         *type = TABLE_TYPE_SYSTEM_TIME;
         *parsed_data_out = parse_system_time(doc);
+    } else if (xmlStrcmp(root->name, (const xmlChar *)"RatingRegionTables") == 0 ||
+               xmlStrcmp(root->name, (const xmlChar *)"RRT") == 0) {
+        *type = TABLE_TYPE_RRT;
+        *parsed_data_out = parse_rrt(doc);
     } else if (xmlStrcmp(root->name, (const xmlChar *)"UCT") == 0) {
         *type = TABLE_TYPE_UCT;
         *parsed_data_out = parse_uct(doc);
@@ -3546,6 +4330,14 @@ int parse_xml(const char* xml_content, int len, TableType* type, void** parsed_d
         *type = TABLE_TYPE_DWD;
         *parsed_data_out = parse_dwd(doc);
     }
+    else if (xmlStrcmp(root->name, (const xmlChar *)"UDS") == 0) {
+        *type = TABLE_TYPE_UDS;
+        *parsed_data_out = parse_uds(doc);
+    }
+    else if (xmlStrcmp(root->name, (const xmlChar *)"AEAT") == 0) {
+        *type = TABLE_TYPE_AEAT;
+        *parsed_data_out = parse_aeat(doc);
+    }
     else if (xmlStrcmp(root->name, (const xmlChar *)"metadataEnvelope") == 0) {
         *type = TABLE_TYPE_SERVICE_SIGNALING;
         *parsed_data_out = parse_service_signaling(doc);
@@ -3555,7 +4347,21 @@ int parse_xml(const char* xml_content, int len, TableType* type, void** parsed_d
         *parsed_data_out = parse_mp_table(doc);
     }
     else {
+        // Store unrecognized table types so they can be displayed
         printf("--> INFO: Encountered unrecognized XML root element: '%s'\n", root->name);
+        
+        UnhandledTableData* unhandled = calloc(1, sizeof(UnhandledTableData));
+        if (unhandled) {
+            strncpy(unhandled->root_element, (const char*)root->name, sizeof(unhandled->root_element) - 1);
+            
+            // Try to get namespace
+            if (root->ns && root->ns->href) {
+                strncpy(unhandled->namespace_uri, (const char*)root->ns->href, sizeof(unhandled->namespace_uri) - 1);
+            }
+            
+            *type = TABLE_TYPE_UNHANDLED;
+            *parsed_data_out = unhandled;
+        }
     }
 
     printf("DEBUG: About to free XML doc\n");
@@ -3654,7 +4460,7 @@ void parse_embedded_children(xmlNodePtr parent_node, const char* destIp, const c
                 if (fdt_data) {
                     xmlBufferPtr buf = xmlBufferCreate();
                     xmlNodeDump(buf, cur_node->doc, cur_node, 0, 1);
-                    store_unique_table((const char*)buf->content, buf->use, TABLE_TYPE_FDT, fdt_data, destIp, destPort);
+                    store_unique_table((const char*)buf->content, buf->use, TABLE_TYPE_FDT, fdt_data, destIp, destPort, 0, -1);
                     xmlBufferFree(buf);
                 }
             }
@@ -3879,36 +4685,7 @@ MpdData* parse_mpd(xmlDocPtr doc) {
                         while(audio_config_node != NULL) {
                             if(audio_config_node->type == XML_ELEMENT_NODE && 
                                xmlStrcmp(audio_config_node->name, (const xmlChar*)"AudioChannelConfiguration") == 0) {
-                                prop = xmlGetProp(audio_config_node, (const xmlChar*)"value");
-                                if(prop) { 
-                                    // Handle AC-4 hex encoding for channel configuration
-                                    if (strlen((char*)prop) == 6) {
-                                        // 6-character hex string - decode according to Dolby AC-4 spec
-                                        unsigned int hex_value = 0;
-                                        if (sscanf((char*)prop, "%06x", &hex_value) == 1) {
-                                            // Map AC-4 hex values to channel counts based on Dolby spec
-                                            switch (hex_value) {
-                                                case 0x000002: strcpy(rep->audioChannelCount, "1"); break;   // 1.0 (C)
-                                                case 0x000001: strcpy(rep->audioChannelCount, "2"); break;   // 2.0 (L, R)
-                                                case 0x000047: strcpy(rep->audioChannelCount, "6"); break;   // 5.1 (L, R, C, LFE, Ls, Rs)
-                                                case 0x0000C7: strcpy(rep->audioChannelCount, "8"); break;   // 5.1.2 (L, R, C, LFE, Ls, Rs, TL, TR)
-                                                case 0x000077: strcpy(rep->audioChannelCount, "10"); break;  // 5.1.4 (L, R, C, LFE, Ls, Rs, Tfl, Tfr, Tbl, Tbr)
-                                                case 0x0000CF: strcpy(rep->audioChannelCount, "10"); break;  // 7.1.2 (L, R, C, LFE, Ls, Rs, Lb, Rb, TL, TR)
-                                                case 0x00007F: strcpy(rep->audioChannelCount, "12"); break;  // 7.1.4 (L, R, C, LFE, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr)
-                                                default:
-                                                    // For unknown hex values, store the original hex string
-                                                    strncpy(rep->audioChannelCount, (char*)prop, sizeof(rep->audioChannelCount)-1);
-                                                    break;
-                                            }
-                                        } else {
-                                            // Invalid hex format, store as-is
-                                            strncpy(rep->audioChannelCount, (char*)prop, sizeof(rep->audioChannelCount)-1);
-                                        }
-                                    } else {
-                                        // Standard decimal integer format
-                                        strncpy(rep->audioChannelCount, (char*)prop, sizeof(rep->audioChannelCount)-1);
-                                    }
-                                    xmlFree(prop); 
+                                if (parse_audio_channel_config(audio_config_node, rep->audioChannelCount, sizeof(rep->audioChannelCount))) {
                                     break;
                                 }
                             }
@@ -3921,36 +4698,7 @@ MpdData* parse_mpd(xmlDocPtr doc) {
                             while(as_audio_config != NULL) {
                                 if(as_audio_config->type == XML_ELEMENT_NODE && 
                                    xmlStrcmp(as_audio_config->name, (const xmlChar*)"AudioChannelConfiguration") == 0) {
-                                    prop = xmlGetProp(as_audio_config, (const xmlChar*)"value");
-                                    if(prop) { 
-                                        // Handle AC-4 hex encoding for channel configuration
-                                        if (strlen((char*)prop) == 6) {
-                                            // 6-character hex string - decode according to Dolby AC-4 spec
-                                            unsigned int hex_value = 0;
-                                            if (sscanf((char*)prop, "%06x", &hex_value) == 1) {
-                                                // Map AC-4 hex values to channel counts based on Dolby spec
-                                                switch (hex_value) {
-                                                    case 0x000002: strcpy(rep->audioChannelCount, "1"); break;   // 1.0 (C)
-                                                    case 0x000001: strcpy(rep->audioChannelCount, "2"); break;   // 2.0 (L, R)
-                                                    case 0x000047: strcpy(rep->audioChannelCount, "6"); break;   // 5.1 (L, R, C, LFE, Ls, Rs)
-                                                    case 0x0000C7: strcpy(rep->audioChannelCount, "8"); break;   // 5.1.2 (L, R, C, LFE, Ls, Rs, TL, TR)
-                                                    case 0x000077: strcpy(rep->audioChannelCount, "10"); break;  // 5.1.4 (L, R, C, LFE, Ls, Rs, Tfl, Tfr, Tbl, Tbr)
-                                                    case 0x0000CF: strcpy(rep->audioChannelCount, "10"); break;  // 7.1.2 (L, R, C, LFE, Ls, Rs, Lb, Rb, TL, TR)
-                                                    case 0x00007F: strcpy(rep->audioChannelCount, "12"); break;  // 7.1.4 (L, R, C, LFE, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr)
-                                                    default:
-                                                        // For unknown hex values, store the original hex string
-                                                        strncpy(rep->audioChannelCount, (char*)prop, sizeof(rep->audioChannelCount)-1);
-                                                        break;
-                                                }
-                                            } else {
-                                                // Invalid hex format, store as-is
-                                                strncpy(rep->audioChannelCount, (char*)prop, sizeof(rep->audioChannelCount)-1);
-                                            }
-                                        } else {
-                                            // Standard decimal integer format
-                                            strncpy(rep->audioChannelCount, (char*)prop, sizeof(rep->audioChannelCount)-1);
-                                        }
-                                        xmlFree(prop); 
+                                    if (parse_audio_channel_config(as_audio_config, rep->audioChannelCount, sizeof(rep->audioChannelCount))) {
                                         break;
                                     }
                                 }
@@ -4279,6 +5027,190 @@ SystemTimeData* parse_system_time(xmlDocPtr doc) {
 }
 
 /**
+ * @brief Parses an RRT (Rating Region Table) XML document.
+ * Handles <RatingRegionTables> with <RatingRegionTable> children per A/331.
+ */
+RrtData* parse_rrt(xmlDocPtr doc) {
+    RrtData* rrt_data = calloc(1, sizeof(RrtData));
+    if (!rrt_data) return NULL;
+
+    xmlNodePtr root = xmlDocGetRootElement(doc);
+    if (!root) {
+        free(rrt_data);
+        return NULL;
+    }
+
+    RrtRegion* region_tail = NULL;
+
+    // Find RatingRegionTable elements (children of RatingRegionTables)
+    xmlNodePtr region_node = root->children;
+    
+    // If root is RatingRegionTable directly, process it
+    if (xmlStrcmp(root->name, (const xmlChar *)"RatingRegionTable") == 0) {
+        region_node = root;
+    }
+
+    while (region_node) {
+        if (region_node->type == XML_ELEMENT_NODE && 
+            xmlStrcmp(region_node->name, (const xmlChar *)"RatingRegionTable") == 0) {
+            
+            RrtRegion* region = calloc(1, sizeof(RrtRegion));
+            if (!region) {
+                region_node = region_node->next;
+                continue;
+            }
+
+            // Get region identifier attribute
+            xmlChar* prop = xmlGetProp(region_node, (const xmlChar *)"regionIdentifier");
+            if (prop) {
+                region->region_id = atoi((char*)prop);
+                xmlFree(prop);
+            }
+
+            // Look for RegionIdText child element for region name
+            xmlNodePtr child = region_node->children;
+            while (child) {
+                if (child->type == XML_ELEMENT_NODE && 
+                    xmlStrcmp(child->name, (const xmlChar *)"RegionIdText") == 0) {
+                    xmlChar* content = xmlNodeGetContent(child);
+                    if (content) {
+                        strncpy(region->region_name, (char*)content, sizeof(region->region_name) - 1);
+                        xmlFree(content);
+                    }
+                    break;
+                }
+                child = child->next;
+            }
+
+            // Parse Dimension elements
+            RrtDimension* dim_tail = NULL;
+            xmlNodePtr dim_node = region_node->children;
+            
+            while (dim_node) {
+                if (dim_node->type == XML_ELEMENT_NODE && 
+                    xmlStrcmp(dim_node->name, (const xmlChar *)"Dimension") == 0) {
+                    
+                    RrtDimension* dim = calloc(1, sizeof(RrtDimension));
+                    if (!dim) {
+                        dim_node = dim_node->next;
+                        continue;
+                    }
+
+                    // Get dimensionGraduated attribute
+                    prop = xmlGetProp(dim_node, (const xmlChar *)"dimensionGraduated");
+                    if (prop) {
+                        dim->graduated_scale = (strcmp((char*)prop, "true") == 0 || 
+                                                strcmp((char*)prop, "1") == 0) ? 1 : 0;
+                        xmlFree(prop);
+                    }
+
+                    // Look for DimensionTitle child element
+                    xmlNodePtr dim_child = dim_node->children;
+                    while (dim_child) {
+                        if (dim_child->type == XML_ELEMENT_NODE && 
+                            xmlStrcmp(dim_child->name, (const xmlChar *)"DimensionTitle") == 0) {
+                            xmlChar* content = xmlNodeGetContent(dim_child);
+                            if (content) {
+                                strncpy(dim->dimension_name, (char*)content, sizeof(dim->dimension_name) - 1);
+                                xmlFree(content);
+                            }
+                            break;
+                        }
+                        dim_child = dim_child->next;
+                    }
+
+                    // Parse Rating elements
+                    RrtRatingValue* val_tail = NULL;
+                    xmlNodePtr val_node = dim_node->children;
+                    
+                    while (val_node) {
+                        if (val_node->type == XML_ELEMENT_NODE && 
+                            xmlStrcmp(val_node->name, (const xmlChar *)"Rating") == 0) {
+                            
+                            RrtRatingValue* val = calloc(1, sizeof(RrtRatingValue));
+                            if (!val) {
+                                val_node = val_node->next;
+                                continue;
+                            }
+
+                            // Look for RatingValueAbbrev and RatingValueString child elements
+                            xmlNodePtr rating_child = val_node->children;
+                            while (rating_child) {
+                                if (rating_child->type == XML_ELEMENT_NODE) {
+                                    xmlChar* content = xmlNodeGetContent(rating_child);
+                                    if (content && content[0] != '\0') {
+                                        if (xmlStrcmp(rating_child->name, (const xmlChar *)"RatingValueAbbrev") == 0) {
+                                            strncpy(val->abbrev_name, (char*)content, sizeof(val->abbrev_name) - 1);
+                                        } else if (xmlStrcmp(rating_child->name, (const xmlChar *)"RatingValueString") == 0) {
+                                            strncpy(val->full_name, (char*)content, sizeof(val->full_name) - 1);
+                                        }
+                                        xmlFree(content);
+                                    } else if (content) {
+                                        xmlFree(content);
+                                    }
+                                }
+                                rating_child = rating_child->next;
+                            }
+
+                            // Only add if we got at least an abbreviation or full name
+                            if (val->abbrev_name[0] != '\0' || val->full_name[0] != '\0') {
+                                if (dim->values == NULL) {
+                                    dim->values = val;
+                                } else {
+                                    val_tail->next = val;
+                                }
+                                val_tail = val;
+                                dim->num_values++;
+                            } else {
+                                free(val);
+                            }
+                        }
+                        val_node = val_node->next;
+                    }
+
+                    // Only add dimension if it has a name
+                    if (dim->dimension_name[0] != '\0') {
+                        if (region->dimensions == NULL) {
+                            region->dimensions = dim;
+                        } else {
+                            dim_tail->next = dim;
+                        }
+                        dim_tail = dim;
+                        region->num_dimensions++;
+                    } else {
+                        // Free empty dimension
+                        RrtRatingValue* v = dim->values;
+                        while (v) {
+                            RrtRatingValue* next = v->next;
+                            free(v);
+                            v = next;
+                        }
+                        free(dim);
+                    }
+                }
+                dim_node = dim_node->next;
+            }
+
+            // Add region to RRT data
+            if (rrt_data->regions == NULL) {
+                rrt_data->regions = region;
+            } else {
+                region_tail->next = region;
+            }
+            region_tail = region;
+            rrt_data->num_regions++;
+        }
+        
+        // If we started at root (RatingRegionTable), don't iterate siblings
+        if (region_node == root) break;
+        region_node = region_node->next;
+    }
+
+    printf("DEBUG RRT: Parsed %d regions\n", rrt_data->num_regions);
+    return rrt_data;
+}
+
+/**
  * @brief Parses a UCT XML document into UctData struct.
  */
 UctData* parse_uct(xmlDocPtr doc) {
@@ -4365,56 +5297,101 @@ UdstData* parse_udst(xmlDocPtr doc) {
     xmlChar* prop = xmlGetProp(root, (const xmlChar*)"version");
     if(prop) { strncpy(udst_data->version, (char*)prop, sizeof(udst_data->version)-1); xmlFree(prop); }
 
+    UdsData* uds_tail = NULL;
+    
     xmlNodePtr uds_node = root->children;
     while(uds_node != NULL) {
         if(uds_node->type == XML_ELEMENT_NODE && xmlStrcmp(uds_node->name, (const xmlChar*)"UDS") == 0) {
-            xmlNodePtr bss_node = uds_node->children;
-            while(bss_node != NULL) {
-                if(bss_node->type == XML_ELEMENT_NODE && xmlStrcmp(bss_node->name, (const xmlChar*)"broadSpanServices") == 0) {
-                    
-                    xmlNodePtr service_node = bss_node->children;
-                    BroadSpanServiceInfo* current_service_tail = NULL;
-                    while(service_node != NULL) {
-                        if(service_node->type == XML_ELEMENT_NODE && xmlStrcmp(service_node->name, (const xmlChar*)"broadSpanService") == 0) {
-                            BroadSpanServiceInfo* service = calloc(1, sizeof(BroadSpanServiceInfo));
-                            if(!service) continue;
-
-                            prop = xmlGetProp(service_node, (const xmlChar*)"name");
-                            if(prop) { strncpy(service->name, (char*)prop, sizeof(service->name)-1); xmlFree(prop); }
-
-                            xmlNodePtr rsrv_node = service_node->children;
-                            while(rsrv_node != NULL) {
-                                if(rsrv_node->type == XML_ELEMENT_NODE && xmlStrcmp(rsrv_node->name, (const xmlChar*)"rsrv") == 0) {
-                                    RsrvInfo* rsrv = calloc(1, sizeof(RsrvInfo));
-                                    if(rsrv) {
-                                        prop = xmlGetProp(rsrv_node, (const xmlChar*)"name");
-                                        if(prop) { strncpy(rsrv->name, (char*)prop, sizeof(rsrv->name)-1); xmlFree(prop); }
-                                        prop = xmlGetProp(rsrv_node, (const xmlChar*)"srvid");
-                                        if(prop) { strncpy(rsrv->srvid, (char*)prop, sizeof(rsrv->srvid)-1); xmlFree(prop); }
-                                        prop = xmlGetProp(rsrv_node, (const xmlChar*)"destIP");
-                                        if(prop) { strncpy(rsrv->destIP, (char*)prop, sizeof(rsrv->destIP)-1); xmlFree(prop); }
-                                        prop = xmlGetProp(rsrv_node, (const xmlChar*)"destPort");
-                                        if(prop) { strncpy(rsrv->destPort, (char*)prop, sizeof(rsrv->destPort)-1); xmlFree(prop); }
-                                        prop = xmlGetProp(rsrv_node, (const xmlChar*)"orderId");
-                                        if(prop) { strncpy(rsrv->orderId, (char*)prop, sizeof(rsrv->orderId)-1); xmlFree(prop); }
-                                        service->head_rsrv = rsrv;
-                                    }
-                                }
-                                rsrv_node = rsrv_node->next;
-                            }
-
-                             if (udst_data->head_service == NULL) {
-                                udst_data->head_service = service;
-                                current_service_tail = service;
-                            } else {
-                                current_service_tail->next = service;
-                                current_service_tail = service;
-                            }
-                        }
-                        service_node = service_node->next;
+            // Check if this is a simple UDS (has destIP attribute) or complex UDS (has children)
+            xmlChar* dest_ip_attr = xmlGetProp(uds_node, (const xmlChar*)"destIP");
+            
+            if (dest_ip_attr) {
+                xmlFree(dest_ip_attr);
+                // Simple UDS format: use shared parser
+                UdsData* uds = parse_uds_from_node(uds_node);
+                if (uds) {
+                    if (udst_data->head_uds == NULL) {
+                        udst_data->head_uds = uds;
+                        uds_tail = uds;
+                    } else {
+                        uds_tail->next = uds;
+                        uds_tail = uds;
                     }
                 }
-                bss_node = bss_node->next;
+            } else {
+                // Complex UDS format with broadSpanServices children
+                xmlNodePtr bss_node = uds_node->children;
+                while(bss_node != NULL) {
+                    if(bss_node->type == XML_ELEMENT_NODE && xmlStrcmp(bss_node->name, (const xmlChar*)"broadSpanServices") == 0) {
+                        
+                        xmlNodePtr service_node = bss_node->children;
+                        BroadSpanServiceInfo* current_service_tail = NULL;
+                        while(service_node != NULL) {
+                            if(service_node->type == XML_ELEMENT_NODE && xmlStrcmp(service_node->name, (const xmlChar*)"broadSpanService") == 0) {
+                                BroadSpanServiceInfo* service = calloc(1, sizeof(BroadSpanServiceInfo));
+                                if(!service) continue;
+
+                                // Try name first, then gsid, then type for service name
+                                prop = xmlGetProp(service_node, (const xmlChar*)"name");
+                                if(prop) { strncpy(service->name, (char*)prop, sizeof(service->name)-1); xmlFree(prop); }
+                                else {
+                                    prop = xmlGetProp(service_node, (const xmlChar*)"gsid");
+                                    if(prop) { strncpy(service->name, (char*)prop, sizeof(service->name)-1); xmlFree(prop); }
+                                }
+                                // Also get type attribute
+                                prop = xmlGetProp(service_node, (const xmlChar*)"type");
+                                if(prop) { 
+                                    // Append type to name if we have both
+                                    if (service->name[0] && strlen(service->name) < sizeof(service->name) - 10) {
+                                        strcat(service->name, " (");
+                                        strncat(service->name, (char*)prop, sizeof(service->name) - strlen(service->name) - 2);
+                                        strcat(service->name, ")");
+                                    }
+                                    xmlFree(prop); 
+                                }
+
+                                xmlNodePtr child_node = service_node->children;
+                                while(child_node != NULL) {
+                                    // Handle both <rsrv> and <session> elements
+                                    if(child_node->type == XML_ELEMENT_NODE && 
+                                       (xmlStrcmp(child_node->name, (const xmlChar*)"rsrv") == 0 ||
+                                        xmlStrcmp(child_node->name, (const xmlChar*)"session") == 0)) {
+                                        RsrvInfo* rsrv = calloc(1, sizeof(RsrvInfo));
+                                        if(rsrv) {
+                                            prop = xmlGetProp(child_node, (const xmlChar*)"name");
+                                            if(prop) { strncpy(rsrv->name, (char*)prop, sizeof(rsrv->name)-1); xmlFree(prop); }
+                                            prop = xmlGetProp(child_node, (const xmlChar*)"srvid");
+                                            if(prop) { strncpy(rsrv->srvid, (char*)prop, sizeof(rsrv->srvid)-1); xmlFree(prop); }
+                                            // Also try sessionId
+                                            if (!rsrv->srvid[0]) {
+                                                prop = xmlGetProp(child_node, (const xmlChar*)"sessionId");
+                                                if(prop) { strncpy(rsrv->srvid, (char*)prop, sizeof(rsrv->srvid)-1); xmlFree(prop); }
+                                            }
+                                            prop = xmlGetProp(child_node, (const xmlChar*)"destIP");
+                                            if(prop) { strncpy(rsrv->destIP, (char*)prop, sizeof(rsrv->destIP)-1); xmlFree(prop); }
+                                            prop = xmlGetProp(child_node, (const xmlChar*)"destPort");
+                                            if(prop) { strncpy(rsrv->destPort, (char*)prop, sizeof(rsrv->destPort)-1); xmlFree(prop); }
+                                            prop = xmlGetProp(child_node, (const xmlChar*)"orderId");
+                                            if(prop) { strncpy(rsrv->orderId, (char*)prop, sizeof(rsrv->orderId)-1); xmlFree(prop); }
+                                            service->head_rsrv = rsrv;
+                                        }
+                                    }
+                                    child_node = child_node->next;
+                                }
+
+                                 if (udst_data->head_service == NULL) {
+                                    udst_data->head_service = service;
+                                    current_service_tail = service;
+                                } else {
+                                    current_service_tail->next = service;
+                                    current_service_tail = service;
+                                }
+                            }
+                            service_node = service_node->next;
+                        }
+                    }
+                    bss_node = bss_node->next;
+                }
             }
         }
         uds_node = uds_node->next;
@@ -4510,7 +5487,7 @@ UsdbData* parse_usbd(xmlDocPtr doc) {
                 TableType type = TABLE_TYPE_USD;
                 void* usd_parsed_data = NULL;
                 if (parse_xml(usd_xml, strlen(usd_xml), &type, &usd_parsed_data, "Nested USD") == 0 && usd_parsed_data) {
-                    store_unique_table(usd_xml, strlen(usd_xml), TABLE_TYPE_USD, usd_parsed_data, "", "");
+                    store_unique_table(usd_xml, strlen(usd_xml), TABLE_TYPE_USD, usd_parsed_data, "", "", 0, -1);
                 }
                 free(usd_xml);
             }
@@ -4626,6 +5603,189 @@ DwdData* parse_dwd(xmlDocPtr doc) {
     return dwd_data;
 }
 
+/**
+ * @brief Parses a UDS (User Defined Stream) XML document.
+ */
+/**
+ * @brief Parses UDS attributes from an XML node into a UdsData struct.
+ * Can be used for standalone UDS tables or UDS elements inside UDST.
+ */
+UdsData* parse_uds_from_node(xmlNodePtr node) {
+    if (!node) return NULL;
+    
+    UdsData* uds_data = calloc(1, sizeof(UdsData));
+    if (!uds_data) return NULL;
+
+    xmlChar* prop;
+    
+    prop = xmlGetProp(node, (const xmlChar *)"contextId");
+    if (prop) { strncpy(uds_data->contextId, (char*)prop, sizeof(uds_data->contextId)-1); xmlFree(prop); }
+    
+    prop = xmlGetProp(node, (const xmlChar *)"destIP");
+    if (prop) { strncpy(uds_data->destIP, (char*)prop, sizeof(uds_data->destIP)-1); xmlFree(prop); }
+    
+    prop = xmlGetProp(node, (const xmlChar *)"destPort");
+    if (prop) { strncpy(uds_data->destPort, (char*)prop, sizeof(uds_data->destPort)-1); xmlFree(prop); }
+    
+    prop = xmlGetProp(node, (const xmlChar *)"maxBitrate");
+    if (prop) { strncpy(uds_data->maxBitrate, (char*)prop, sizeof(uds_data->maxBitrate)-1); xmlFree(prop); }
+    
+    prop = xmlGetProp(node, (const xmlChar *)"name");
+    if (prop) { strncpy(uds_data->name, (char*)prop, sizeof(uds_data->name)-1); xmlFree(prop); }
+
+    uds_data->sample_collected = 0;
+    uds_data->sample_payload_len = 0;
+
+    return uds_data;
+}
+
+UdsData* parse_uds(xmlDocPtr doc) {
+    xmlNodePtr root = xmlDocGetRootElement(doc);
+    return parse_uds_from_node(root);
+}
+
+/**
+ * @brief Parses an AEAT (Advanced Emergency Alert Table) XML document.
+ */
+AeatData* parse_aeat(xmlDocPtr doc) {
+    AeatData* aeat_data = calloc(1, sizeof(AeatData));
+    if (!aeat_data) return NULL;
+
+    xmlNodePtr root = xmlDocGetRootElement(doc);
+    if (!root) {
+        free(aeat_data);
+        return NULL;
+    }
+
+    xmlChar* prop;
+    AeaEntry* current_aea_tail = NULL;
+    
+    // Iterate through AEA elements
+    for (xmlNodePtr aea_node = root->children; aea_node; aea_node = aea_node->next) {
+        if (aea_node->type != XML_ELEMENT_NODE) continue;
+        if (xmlStrcmp(aea_node->name, (const xmlChar *)"AEA") != 0) continue;
+        
+        AeaEntry* aea = calloc(1, sizeof(AeaEntry));
+        if (!aea) continue;
+        
+        // Parse AEA attributes
+        prop = xmlGetProp(aea_node, (const xmlChar *)"aeaId");
+        if (prop) { strncpy(aea->aeaId, (char*)prop, sizeof(aea->aeaId)-1); xmlFree(prop); }
+        
+        prop = xmlGetProp(aea_node, (const xmlChar *)"aeaType");
+        if (prop) { strncpy(aea->aeaType, (char*)prop, sizeof(aea->aeaType)-1); xmlFree(prop); }
+        
+        prop = xmlGetProp(aea_node, (const xmlChar *)"audience");
+        if (prop) { strncpy(aea->audience, (char*)prop, sizeof(aea->audience)-1); xmlFree(prop); }
+        
+        prop = xmlGetProp(aea_node, (const xmlChar *)"category");
+        if (prop) { strncpy(aea->category, (char*)prop, sizeof(aea->category)-1); xmlFree(prop); }
+        
+        prop = xmlGetProp(aea_node, (const xmlChar *)"issuer");
+        if (prop) { strncpy(aea->issuer, (char*)prop, sizeof(aea->issuer)-1); xmlFree(prop); }
+        
+        prop = xmlGetProp(aea_node, (const xmlChar *)"priority");
+        if (prop) { strncpy(aea->priority, (char*)prop, sizeof(aea->priority)-1); xmlFree(prop); }
+        
+        prop = xmlGetProp(aea_node, (const xmlChar *)"wakeup");
+        if (prop) { strncpy(aea->wakeup, (char*)prop, sizeof(aea->wakeup)-1); xmlFree(prop); }
+        
+        // Parse child elements
+        AeatMedia* current_media_tail = NULL;
+        for (xmlNodePtr child = aea_node->children; child; child = child->next) {
+            if (child->type != XML_ELEMENT_NODE) continue;
+            
+            if (xmlStrcmp(child->name, (const xmlChar *)"Header") == 0) {
+                prop = xmlGetProp(child, (const xmlChar *)"effective");
+                if (prop) { strncpy(aea->effective, (char*)prop, sizeof(aea->effective)-1); xmlFree(prop); }
+                
+                prop = xmlGetProp(child, (const xmlChar *)"expires");
+                if (prop) { strncpy(aea->expires, (char*)prop, sizeof(aea->expires)-1); xmlFree(prop); }
+                
+                // Parse Header children (EventCode, EventDesc, Location)
+                for (xmlNodePtr hdr_child = child->children; hdr_child; hdr_child = hdr_child->next) {
+                    if (hdr_child->type != XML_ELEMENT_NODE) continue;
+                    
+                    if (xmlStrcmp(hdr_child->name, (const xmlChar *)"EventCode") == 0) {
+                        prop = xmlGetProp(hdr_child, (const xmlChar *)"type");
+                        if (prop) { strncpy(aea->eventCodeType, (char*)prop, sizeof(aea->eventCodeType)-1); xmlFree(prop); }
+                        
+                        xmlChar* content = xmlNodeGetContent(hdr_child);
+                        if (content) { strncpy(aea->eventCode, (char*)content, sizeof(aea->eventCode)-1); xmlFree(content); }
+                    }
+                    else if (xmlStrcmp(hdr_child->name, (const xmlChar *)"EventDesc") == 0) {
+                        prop = xmlGetProp(hdr_child, (const xmlChar *)"lang");
+                        if (!prop) prop = xmlGetNsProp(hdr_child, (const xmlChar *)"lang", (const xmlChar *)"http://www.w3.org/XML/1998/namespace");
+                        if (prop) { strncpy(aea->eventDescLang, (char*)prop, sizeof(aea->eventDescLang)-1); xmlFree(prop); }
+                        
+                        xmlChar* content = xmlNodeGetContent(hdr_child);
+                        if (content) { strncpy(aea->eventDesc, (char*)content, sizeof(aea->eventDesc)-1); xmlFree(content); }
+                    }
+                    else if (xmlStrcmp(hdr_child->name, (const xmlChar *)"Location") == 0) {
+                        prop = xmlGetProp(hdr_child, (const xmlChar *)"type");
+                        if (prop) { strncpy(aea->locationType, (char*)prop, sizeof(aea->locationType)-1); xmlFree(prop); }
+                        
+                        xmlChar* content = xmlNodeGetContent(hdr_child);
+                        if (content) { strncpy(aea->location, (char*)content, sizeof(aea->location)-1); xmlFree(content); }
+                    }
+                }
+            }
+            else if (xmlStrcmp(child->name, (const xmlChar *)"AEAText") == 0) {
+                prop = xmlGetProp(child, (const xmlChar *)"lang");
+                if (!prop) prop = xmlGetNsProp(child, (const xmlChar *)"lang", (const xmlChar *)"http://www.w3.org/XML/1998/namespace");
+                if (prop) { strncpy(aea->aeaTextLang, (char*)prop, sizeof(aea->aeaTextLang)-1); xmlFree(prop); }
+                
+                xmlChar* content = xmlNodeGetContent(child);
+                if (content) { strncpy(aea->aeaText, (char*)content, sizeof(aea->aeaText)-1); xmlFree(content); }
+            }
+            else if (xmlStrcmp(child->name, (const xmlChar *)"Media") == 0) {
+                AeatMedia* media = calloc(1, sizeof(AeatMedia));
+                if (!media) continue;
+                
+                prop = xmlGetProp(child, (const xmlChar *)"url");
+                if (prop) { strncpy(media->url, (char*)prop, sizeof(media->url)-1); xmlFree(prop); }
+                
+                prop = xmlGetProp(child, (const xmlChar *)"contentType");
+                if (prop) { strncpy(media->contentType, (char*)prop, sizeof(media->contentType)-1); xmlFree(prop); }
+                
+                prop = xmlGetProp(child, (const xmlChar *)"contentLength");
+                if (prop) { strncpy(media->contentLength, (char*)prop, sizeof(media->contentLength)-1); xmlFree(prop); }
+                
+                prop = xmlGetProp(child, (const xmlChar *)"mediaType");
+                if (prop) { strncpy(media->mediaType, (char*)prop, sizeof(media->mediaType)-1); xmlFree(prop); }
+                
+                prop = xmlGetProp(child, (const xmlChar *)"mediaDesc");
+                if (prop) { strncpy(media->mediaDesc, (char*)prop, sizeof(media->mediaDesc)-1); xmlFree(prop); }
+                
+                prop = xmlGetProp(child, (const xmlChar *)"lang");
+                if (!prop) prop = xmlGetNsProp(child, (const xmlChar *)"lang", (const xmlChar *)"http://www.w3.org/XML/1998/namespace");
+                if (prop) { strncpy(media->lang, (char*)prop, sizeof(media->lang)-1); xmlFree(prop); }
+                
+                // Add to media list
+                if (aea->head_media == NULL) {
+                    aea->head_media = media;
+                    current_media_tail = media;
+                } else {
+                    current_media_tail->next = media;
+                    current_media_tail = media;
+                }
+            }
+        }
+        
+        // Add AEA to list
+        if (aeat_data->head_aea == NULL) {
+            aeat_data->head_aea = aea;
+            current_aea_tail = aea;
+        } else {
+            current_aea_tail->next = aea;
+            current_aea_tail = aea;
+        }
+        aeat_data->aea_count++;
+    }
+
+    return aeat_data;
+}
+
 
 /**
  * @brief Parses a metadataEnvelope (Service Signaling) XML document.
@@ -4696,8 +5856,18 @@ StsidData* parse_stsid(xmlDocPtr doc) {
 
     prop = xmlGetProp(rs_node, (const xmlChar*)"dIpAddr");
     if(prop) { strncpy(stsid_data->dIpAddr, (char*)prop, sizeof(stsid_data->dIpAddr)-1); xmlFree(prop); }
+    else {
+        // Try sIpAddr as fallback (source IP)
+        prop = xmlGetProp(rs_node, (const xmlChar*)"sIpAddr");
+        if(prop) { strncpy(stsid_data->dIpAddr, (char*)prop, sizeof(stsid_data->dIpAddr)-1); xmlFree(prop); }
+    }
     prop = xmlGetProp(rs_node, (const xmlChar*)"dPort");
     if(prop) { strncpy(stsid_data->dPort, (char*)prop, sizeof(stsid_data->dPort)-1); xmlFree(prop); }
+    else {
+        // Try sPort as fallback
+        prop = xmlGetProp(rs_node, (const xmlChar*)"sPort");
+        if(prop) { strncpy(stsid_data->dPort, (char*)prop, sizeof(stsid_data->dPort)-1); xmlFree(prop); }
+    }
 
     // Iterate through LS nodes
     xmlNodePtr ls_node = rs_node->children;
@@ -4773,6 +5943,65 @@ StsidData* parse_stsid(xmlDocPtr doc) {
                         }
                     }
                 }
+                
+                // Parse embedded EFDT for file manifest
+                xmlNodePtr efdt_node = srcflow_node->children;
+                while (efdt_node != NULL) {
+                    if (efdt_node->type == XML_ELEMENT_NODE && xmlStrcmp(efdt_node->name, (const xmlChar*)"EFDT") == 0) {
+                        // Look for FDT-Instance inside EFDT
+                        xmlNodePtr fdt_instance = efdt_node->children;
+                        while (fdt_instance != NULL) {
+                            if (fdt_instance->type == XML_ELEMENT_NODE && 
+                                xmlStrcmp(fdt_instance->name, (const xmlChar*)"FDT-Instance") == 0) {
+                                // Parse File entries (may be namespaced as fdt:File)
+                                xmlNodePtr file_node = fdt_instance->children;
+                                StsidFileEntry* file_tail = NULL;
+                                while (file_node != NULL) {
+                                    // Check for "File" element
+                                    if (file_node->type == XML_ELEMENT_NODE && 
+                                        xmlStrcmp(file_node->name, (const xmlChar*)"File") == 0) {
+                                        StsidFileEntry* file_entry = calloc(1, sizeof(StsidFileEntry));
+                                        if (file_entry) {
+                                            prop = xmlGetProp(file_node, (const xmlChar*)"TOI");
+                                            if (prop) {
+                                                file_entry->toi = (uint32_t)strtoul((char*)prop, NULL, 10);
+                                                xmlFree(prop);
+                                            }
+                                            prop = xmlGetProp(file_node, (const xmlChar*)"Content-Location");
+                                            if (prop) {
+                                                strncpy(file_entry->content_location, (char*)prop, sizeof(file_entry->content_location) - 1);
+                                                xmlFree(prop);
+                                            }
+                                            prop = xmlGetProp(file_node, (const xmlChar*)"Content-Length");
+                                            if (prop) {
+                                                file_entry->content_length = strtoull((char*)prop, NULL, 10);
+                                                xmlFree(prop);
+                                            }
+                                            prop = xmlGetProp(file_node, (const xmlChar*)"Content-Type");
+                                            if (prop) {
+                                                strncpy(file_entry->content_type, (char*)prop, sizeof(file_entry->content_type) - 1);
+                                                xmlFree(prop);
+                                            }
+                                            
+                                            // Add to list
+                                            if (ls->head_file == NULL) {
+                                                ls->head_file = file_entry;
+                                            } else {
+                                                file_tail->next = file_entry;
+                                            }
+                                            file_tail = file_entry;
+                                            ls->file_count++;
+                                        }
+                                    }
+                                    file_node = file_node->next;
+                                }
+                            }
+                            fdt_instance = fdt_instance->next;
+                        }
+                    }
+                    efdt_node = efdt_node->next;
+                }
+                
                 // Also parse any embedded tables like FDT within the SrcFlow
                 parse_embedded_children(srcflow_node, stsid_data->dIpAddr, stsid_data->dPort);
             }
@@ -4906,14 +6135,20 @@ int compare_data_usage(const void *a, const void *b) {
     return 0;
 }
 
-// Add this new comparison function for sorting by bytes
 int compare_data_usage_by_bytes(const void *a, const void *b) {
-    const DataUsageEntry *entry_a = (const DataUsageEntry *)a;
-    const DataUsageEntry *entry_b = (const DataUsageEntry *)b;
+    DataUsageEntry *entry_a = (DataUsageEntry *)a;
+    DataUsageEntry *entry_b = (DataUsageEntry *)b;
     
-    // Sort by total bytes (descending)
-    if (entry_a->total_bytes > entry_b->total_bytes) return -1;
-    if (entry_a->total_bytes < entry_b->total_bytes) return 1;
+    // Always sort stuffing to the end
+    int a_is_stuffing = (strcmp(entry_a->stream_type, "Stuffing") == 0);
+    int b_is_stuffing = (strcmp(entry_b->stream_type, "Stuffing") == 0);
+    
+    if (a_is_stuffing && !b_is_stuffing) return 1;   // a goes after b
+    if (!a_is_stuffing && b_is_stuffing) return -1;  // a goes before b
+    
+    // Both stuffing or both not stuffing - sort by bytes descending
+    if (entry_b->total_bytes > entry_a->total_bytes) return 1;
+    if (entry_b->total_bytes < entry_a->total_bytes) return -1;
     return 0;
 }
 
@@ -5002,10 +6237,13 @@ void generate_data_usage_chart(FILE *f) {
     fprintf(f, "    if (n === 1) { // Usage column - extract percentage\n");
     fprintf(f, "      aVal = parseFloat(aVal.match(/([0-9.]+)%%/)[1]);\n");
     fprintf(f, "      bVal = parseFloat(bVal.match(/([0-9.]+)%%/)[1]);\n");
-    fprintf(f, "    } else if (n === 4) { // Total Data column - convert to bytes\n");
+    fprintf(f, "    } else if (n === 4) { // Packet Count - integer (NEW)\n");
+    fprintf(f, "      aVal = parseInt(aVal.replace(/,/g, ''));\n");
+    fprintf(f, "      bVal = parseInt(bVal.replace(/,/g, ''));\n");
+    fprintf(f, "    } else if (n === 5) { // Total Data column - convert to bytes (Shifted from 4)\n");
     fprintf(f, "      aVal = parseDataSize(aVal);\n");
     fprintf(f, "      bVal = parseDataSize(bVal);\n");
-    fprintf(f, "    } else if (n === 5) { // Bitrate column - convert to bps\n");
+    fprintf(f, "    } else if (n === 6) { // Bitrate column - convert to bps (Shifted from 5)\n");
     fprintf(f, "      aVal = parseBitrate(aVal);\n");
     fprintf(f, "      bVal = parseBitrate(bVal);\n");
     fprintf(f, "    }\n");
@@ -5062,8 +6300,9 @@ void generate_data_usage_chart(FILE *f) {
     fprintf(f, "<th onclick='sortTable(1)' style='cursor:pointer;'>Usage ↓</th>");
     fprintf(f, "<th onclick='sortTable(2)' style='cursor:pointer;'>Service</th>");
     fprintf(f, "<th onclick='sortTable(3)' style='cursor:pointer;'>Type</th>");
-    fprintf(f, "<th onclick='sortTable(4)' style='cursor:pointer;'>Total Data</th>");
-    fprintf(f, "<th onclick='sortTable(5)' style='cursor:pointer;'>Bitrate</th>");
+    fprintf(f, "<th onclick='sortTable(4)' style='cursor:pointer;'>Packets</th>"); // NEW
+    fprintf(f, "<th onclick='sortTable(5)' style='cursor:pointer;'>Total Data</th>");
+    fprintf(f, "<th onclick='sortTable(6)' style='cursor:pointer;'>Bitrate</th>");
     fprintf(f, "</tr></thead>\n");
     
     for (int i = 0; i < g_data_usage_count; i++) {
@@ -5072,41 +6311,64 @@ void generate_data_usage_chart(FILE *f) {
         
         // Determine bar color based on stream type and media content
         const char* bar_color;
+        
+        // First check if this is a known service
+        const char* service_name_check = get_service_name_for_destination(entry->destinationIp, entry->destinationPort);
+        int is_known_service = (service_name_check != NULL);
+        
         if (entry->is_lls) {
             bar_color = "#00aa00"; // Green for LLS
         } else if (entry->is_signaling) {
             bar_color = "#ff6600"; // Orange for all signaling
+        } else if (!is_known_service) {
+            bar_color = "#000000"; // Black for unknown/unidentified services
         } else if (strcmp(entry->stream_type, "ROUTE") == 0) {
-            // Get specific media type for ROUTE streams
+            // Get specific media type for ROUTE streams (known service)
             const char* route_media_type = get_media_type_from_stsid(entry->destinationIp, entry->destinationPort, entry->tsi_or_packet_id);
             if (strstr(route_media_type, "video") || strstr(route_media_type, "Video")) {
                 bar_color = "#0066cc"; // Blue for ROUTE video
             } else if (strstr(route_media_type, "audio") || strstr(route_media_type, "Audio")) {
                 bar_color = "#00cc00"; // Green for ROUTE audio
-            } else if (strstr(route_media_type, "caption") || strstr(route_media_type, "Data")) {
-                bar_color = "#cc00cc"; // Pink for ROUTE captions/data
+            } else if (strstr(route_media_type, "caption") || strstr(route_media_type, "Caption") || strstr(route_media_type, "subtitles")) {
+                bar_color = "#cc00cc"; // Pink for ROUTE captions
             } else {
-                bar_color = "#424242"; // Dark gray for other ROUTE media
+                bar_color = "#9933ff"; // Purple for other identified ROUTE media (known service)
             }
         } else if (strcmp(entry->stream_type, "MMT") == 0) {
-            // Get specific media type for MMT streams
+            // Get specific media type for MMT streams (known service)
             const char* mmt_media_type = get_media_type_from_mpt(entry->destinationIp, entry->destinationPort, entry->tsi_or_packet_id);
             if (strstr(mmt_media_type, "video") || strstr(mmt_media_type, "Video")) {
                 bar_color = "#0066cc"; // Blue for MMT video
             } else if (strstr(mmt_media_type, "audio") || strstr(mmt_media_type, "Audio")) {
                 bar_color = "#00cc00"; // Green for MMT audio
-            } else if (strstr(mmt_media_type, "caption") || strstr(mmt_media_type, "Data")) {
-                bar_color = "#cc00cc"; // Pink for MMT captions/data
+            } else if (strstr(mmt_media_type, "caption") || strstr(mmt_media_type, "Caption") || strstr(mmt_media_type, "subtitles")) {
+                bar_color = "#cc00cc"; // Pink for MMT captions
             } else {
-                bar_color = "#424242"; // Dark gray for other MMT media
+                bar_color = "#9933ff"; // Purple for other identified MMT media (known service)
             }
         } else {
-            bar_color = "#999999"; // Gray for other/unknown
+            bar_color = "#9933ff"; // Purple for other known service types
         }
         
         // Calculate bandwidth if timing available
         char bandwidth_str[64] = "N/A";
-        if (g_input_type == INPUT_TYPE_PCAP && g_pcap_timing_valid && g_packet_count > 1) {
+        
+        // For ALP-PCAP, use global timing so bitrates sum correctly to channel bandwidth
+        if (g_input_type == INPUT_TYPE_ALP_PCAP && g_pcap_timing_valid && g_packet_count > 1) {
+            double duration_seconds = (double)(g_last_packet_time.tv_sec - g_first_packet_time.tv_sec) + 
+                                    (double)(g_last_packet_time.tv_usec - g_first_packet_time.tv_usec) / 1000000.0;
+            if (duration_seconds > 0) {
+                double bps = entry->total_bytes * 8.0 / duration_seconds;
+                if (bps >= 1000000) {
+                    snprintf(bandwidth_str, sizeof(bandwidth_str), "%.2f Mbps", bps / 1000000.0);
+                } else if (bps >= 1000) {
+                    snprintf(bandwidth_str, sizeof(bandwidth_str), "%.1f Kbps", bps / 1000.0);
+                } else {
+                    snprintf(bandwidth_str, sizeof(bandwidth_str), "%.0f bps", bps);
+                }
+            }
+        } else if (g_input_type == INPUT_TYPE_PCAP && g_pcap_timing_valid && g_packet_count > 1) {
+            // Regular PCAP uses global timing
             double duration_seconds = (double)(g_last_packet_time.tv_sec - g_first_packet_time.tv_sec) + 
                                      (double)(g_last_packet_time.tv_usec - g_first_packet_time.tv_usec) / 1000000.0;
             if (duration_seconds > 0) {
@@ -5169,6 +6431,12 @@ void generate_data_usage_chart(FILE *f) {
             } else {
                 fprintf(f, " (PID %u)", entry->tsi_or_packet_id);
             }
+        } else if (strcmp(entry->stream_type, "MPEG-TS") == 0 || strcmp(entry->stream_type, "MPEG-TS Null") == 0) {
+            fprintf(f, " (PID 0x%04X)", entry->tsi_or_packet_id);
+        } else if (strcmp(entry->stream_type, "RTP/MPEG-TS") == 0 || strcmp(entry->stream_type, "RTP/MPEG-TS Null") == 0) {
+            fprintf(f, " (PID 0x%04X)", entry->tsi_or_packet_id);
+        } else if (strcmp(entry->stream_type, "RTP") == 0) {
+            fprintf(f, " (PT %u)", entry->tsi_or_packet_id);
         } else if (entry->is_lls) {
             fprintf(f, " (LLS)");
         } else if (is_bps_service(entry->destinationIp, entry->destinationPort)) {
@@ -5188,10 +6456,13 @@ void generate_data_usage_chart(FILE *f) {
         // Column 4: Type
         fprintf(f, "  <td style='font-size:small;'>%s</td>\n", media_type);
         
-        // Column 5: Total Data
+        // Column 5: Packets (NEW)
+        fprintf(f, "  <td style='font-size:small;'>%u</td>\n", entry->packet_count);
+
+        // Column 6: Total Data
         fprintf(f, "  <td style='font-size:small;'>%s</td>\n", data_size_str);
         
-        // Column 6: Bitrate
+        // Column 7: Bitrate
         fprintf(f, "  <td style='font-size:small;'>%s</td>\n", bandwidth_str);
         
         fprintf(f, "</tr>\n");
@@ -5218,6 +6489,498 @@ void generate_data_usage_chart(FILE *f) {
             (double)media_bytes / g_total_capture_bytes * 100.0,
             (double)other_bytes / g_total_capture_bytes * 100.0);
     fprintf(f, "</p>\n");
+}
+
+// Generate Unknown Service Analysis section
+void generate_unknown_service_analysis(FILE *f) {
+    // Count unknown services
+    int unknown_count = 0;
+    for (int i = 0; i < g_data_usage_count; i++) {
+        const char* svc_name = get_service_name_for_destination(g_data_usage[i].destinationIp, g_data_usage[i].destinationPort);
+        if (!svc_name && !g_data_usage[i].is_lls && !g_data_usage[i].is_signaling && 
+            strcmp(g_data_usage[i].stream_type, "Stuffing") != 0) {
+            unknown_count++;
+        }
+    }
+    
+    if (unknown_count == 0) {
+        return;
+    }
+    
+    fprintf(f, "<details><summary>Unknown Service Analysis (%d streams)</summary>\n", unknown_count);
+    fprintf(f, "<div class='details-content'>\n");
+    fprintf(f, "<table>\n<thead><tr><th>Destination</th><th>Stream Type</th><th>Payload Analysis</th></tr></thead>\n<tbody>\n");
+    
+    for (int i = 0; i < g_data_usage_count; i++) {
+        DataUsageEntry* entry = &g_data_usage[i];
+        const char* svc_name = get_service_name_for_destination(entry->destinationIp, entry->destinationPort);
+        
+        if (svc_name || entry->is_lls || entry->is_signaling || strcmp(entry->stream_type, "Stuffing") == 0) {
+            continue;
+        }
+        
+        fprintf(f, "<tr><td style='font-family:monospace;'>%s:%s", entry->destinationIp, entry->destinationPort);
+        if (strcmp(entry->stream_type, "ROUTE") == 0) {
+            fprintf(f, "<br>(TSI %u)", entry->tsi_or_packet_id);
+        } else if (strcmp(entry->stream_type, "MMT") == 0) {
+            fprintf(f, "<br>(PID %u)", entry->tsi_or_packet_id);
+        } else if (strcmp(entry->stream_type, "MPEG-TS") == 0 || strcmp(entry->stream_type, "MPEG-TS Null") == 0) {
+            fprintf(f, "<br>(PID 0x%04X)", entry->tsi_or_packet_id);
+        } else if (strcmp(entry->stream_type, "RTP/MPEG-TS") == 0 || strcmp(entry->stream_type, "RTP/MPEG-TS Null") == 0) {
+            fprintf(f, "<br>(PID 0x%04X)", entry->tsi_or_packet_id);
+        } else if (strcmp(entry->stream_type, "RTP") == 0) {
+            fprintf(f, "<br>(PT %u)", entry->tsi_or_packet_id);
+        }
+        fprintf(f, "</td>\n");
+        
+        fprintf(f, "<td>%s</td>\n", entry->stream_type);
+        
+        // Analyze sample payload
+        fprintf(f, "<td style='font-family:monospace;font-size:11px;'>");
+        if (entry->sample_collected && entry->sample_payload_len > 0) {
+            // Try to identify payload type
+            int is_gzip = (entry->sample_payload_len >= 2 && 
+                          entry->sample_payload[0] == 0x1f && entry->sample_payload[1] == 0x8b);
+            int is_xml = (entry->sample_payload_len >= 5 && 
+                         memcmp(entry->sample_payload, "<?xml", 5) == 0);
+            int is_mpeg_ts = (entry->sample_payload_len >= 1 && entry->sample_payload[0] == 0x47);
+            int looks_like_text = 1;
+            for (int j = 0; j < entry->sample_payload_len && j < 32; j++) {
+                if (entry->sample_payload[j] < 0x20 && entry->sample_payload[j] != '\n' && 
+                    entry->sample_payload[j] != '\r' && entry->sample_payload[j] != '\t') {
+                    looks_like_text = 0;
+                    break;
+                }
+            }
+            
+            if (is_gzip) {
+                fprintf(f, "<strong>GZIP compressed</strong><br>");
+                // Try to decompress and show preview
+                int decomp_size = 0;
+                int consumed = 0;
+                char* decomp = decompress_gzip(entry->sample_payload, entry->sample_payload_len, &decomp_size, &consumed);
+                if (decomp && decomp_size > 0) {
+                    // Check if decompressed content is XML
+                    if (decomp_size >= 5 && memcmp(decomp, "<?xml", 5) == 0) {
+                        fprintf(f, "Contains XML: ");
+                        
+                        // Find root element
+                        char* root_start = strstr(decomp, "?>");
+                        if (root_start && root_start < decomp + decomp_size - 2) {
+                            root_start += 2;
+                            while (root_start < decomp + decomp_size && (*root_start == ' ' || *root_start == '\n' || *root_start == '\r' || *root_start == '\t')) {
+                                root_start++;
+                            }
+                            if (*root_start == '<') {
+                                root_start++;
+                                char root_element[64] = {0};
+                                int k = 0;
+                                while (root_start < decomp + decomp_size && k < 63 && 
+                                       *root_start != ' ' && *root_start != '>' && *root_start != '\n' && *root_start != '/') {
+                                    root_element[k++] = *root_start++;
+                                }
+                                root_element[k] = '\0';
+                                
+                                if (strlen(root_element) > 0) {
+                                    fprintf(f, "<strong>&lt;%s&gt;</strong>", root_element);
+                                    
+                                    // Identify known table types
+                                    if (strcmp(root_element, "SLT") == 0) {
+                                        fprintf(f, " (Service List Table)");
+                                    } else if (strcmp(root_element, "S-TSID") == 0) {
+                                        fprintf(f, " (ROUTE Stream Description)");
+                                    } else if (strcmp(root_element, "MPD") == 0) {
+                                        fprintf(f, " (DASH Manifest)");
+                                    } else if (strcmp(root_element, "USBD") == 0 || strcmp(root_element, "BundleDescriptionROUTE") == 0) {
+                                        fprintf(f, " (User Service Bundle Description)");
+                                    } else if (strcmp(root_element, "USD") == 0) {
+                                        fprintf(f, " (User Service Description)");
+                                    } else if (strcmp(root_element, "HELD") == 0) {
+                                        fprintf(f, " (HTML Entry Locations)");
+                                    } else if (strcmp(root_element, "RRT") == 0) {
+                                        fprintf(f, " (Rating Region Table)");
+                                    } else if (strcmp(root_element, "SystemTime") == 0) {
+                                        fprintf(f, " (System Time)");
+                                    } else if (strcmp(root_element, "AEAT") == 0) {
+                                        fprintf(f, " (Advanced Emergency Alert)");
+                                    } else if (strcmp(root_element, "OnscreenMessageNotification") == 0) {
+                                        fprintf(f, " (Onscreen Message)");
+                                    } else if (strcmp(root_element, "CAP") == 0 || strcmp(root_element, "alert") == 0) {
+                                        fprintf(f, " (Common Alerting Protocol)");
+                                    } else if (strcmp(root_element, "metadataEnvelope") == 0) {
+                                        fprintf(f, " (Service Signaling)");
+                                    } else if (strcmp(root_element, "MMTPackageTable") == 0) {
+                                        fprintf(f, " (MMT Package Table)");
+                                    } else if (strcmp(root_element, "ESGData") == 0 || strcmp(root_element, "ESGMain") == 0) {
+                                        fprintf(f, " (Electronic Service Guide)");
+                                    } else if (strcmp(root_element, "ContentAdvisoryTable") == 0) {
+                                        fprintf(f, " (Content Advisory)");
+                                    }
+                                    fprintf(f, "<br>");
+                                }
+                            }
+                        }
+                    }
+                    
+                    int preview_len = decomp_size > 100 ? 100 : decomp_size;
+                    fprintf(f, "Preview:<br><code>");
+                    for (int j = 0; j < preview_len; j++) {
+                        char c = decomp[j];
+                        if (c == '<') fprintf(f, "&lt;");
+                        else if (c == '>') fprintf(f, "&gt;");
+                        else if (c == '&') fprintf(f, "&amp;");
+                        else if (c >= 0x20 || c == '\n' || c == '\r' || c == '\t') fputc(c, f);
+                        else fprintf(f, ".");
+                    }
+                    if (decomp_size > 100) fprintf(f, "...");
+                    fprintf(f, "</code>");
+                    free(decomp);
+                } else {
+                    fprintf(f, "(decompression failed or incomplete)");
+                }
+            } else if (is_mpeg_ts) {
+                // Parse MPEG-TS header
+                uint16_t pid = ((entry->sample_payload[1] & 0x1F) << 8) | entry->sample_payload[2];
+                fprintf(f, "<strong>MPEG-TS</strong> (PID 0x%04X", pid);
+                if (pid == 0x1FFF) {
+                    fprintf(f, " - Null/Stuffing");
+                } else if (pid == 0x0000) {
+                    fprintf(f, " - PAT");
+                } else if (pid == 0x0001) {
+                    fprintf(f, " - CAT");
+                } else if (pid < 0x0010) {
+                    fprintf(f, " - Reserved");
+                }
+                fprintf(f, ")<br>");
+                
+                // Scan for embedded XML
+                char* xml_start = NULL;
+                for (int j = 0; j < entry->sample_payload_len - 5; j++) {
+                    if (memcmp(entry->sample_payload + j, "<?xml", 5) == 0) {
+                        xml_start = (char*)(entry->sample_payload + j);
+                        break;
+                    }
+                }
+                
+                if (xml_start) {
+                    int xml_remaining = entry->sample_payload_len - (xml_start - (char*)entry->sample_payload);
+                    fprintf(f, "Contains embedded XML: ");
+                    
+                    // Find root element
+                    char* root_start = strstr(xml_start, "?>");
+                    if (root_start && root_start < xml_start + xml_remaining - 2) {
+                        root_start += 2;
+                        while (root_start < xml_start + xml_remaining && (*root_start == ' ' || *root_start == '\n' || *root_start == '\r' || *root_start == '\t')) {
+                            root_start++;
+                        }
+                        if (*root_start == '<') {
+                            root_start++;
+                            char root_element[64] = {0};
+                            int k = 0;
+                            while (root_start < xml_start + xml_remaining && k < 63 && 
+                                   *root_start != ' ' && *root_start != '>' && *root_start != '\n' && *root_start != '/') {
+                                root_element[k++] = *root_start++;
+                            }
+                            root_element[k] = '\0';
+                            
+                            if (strlen(root_element) > 0) {
+                                fprintf(f, "<strong>&lt;%s&gt;</strong>", root_element);
+                                
+                                // Identify known table types
+                                if (strcmp(root_element, "SLT") == 0) {
+                                    fprintf(f, " (Service List Table)");
+                                } else if (strcmp(root_element, "S-TSID") == 0) {
+                                    fprintf(f, " (ROUTE Stream Description)");
+                                } else if (strcmp(root_element, "MPD") == 0) {
+                                    fprintf(f, " (DASH Manifest)");
+                                } else if (strcmp(root_element, "USBD") == 0 || strcmp(root_element, "BundleDescriptionROUTE") == 0) {
+                                    fprintf(f, " (User Service Bundle Description)");
+                                } else if (strcmp(root_element, "USD") == 0) {
+                                    fprintf(f, " (User Service Description)");
+                                } else if (strcmp(root_element, "HELD") == 0) {
+                                    fprintf(f, " (HTML Entry Locations)");
+                                } else if (strcmp(root_element, "RRT") == 0) {
+                                    fprintf(f, " (Rating Region Table)");
+                                } else if (strcmp(root_element, "SystemTime") == 0) {
+                                    fprintf(f, " (System Time)");
+                                } else if (strcmp(root_element, "AEAT") == 0) {
+                                    fprintf(f, " (Advanced Emergency Alert)");
+                                } else if (strcmp(root_element, "OnscreenMessageNotification") == 0) {
+                                    fprintf(f, " (Onscreen Message)");
+                                } else if (strcmp(root_element, "CAP") == 0 || strcmp(root_element, "alert") == 0) {
+                                    fprintf(f, " (Common Alerting Protocol)");
+                                } else if (strcmp(root_element, "metadataEnvelope") == 0) {
+                                    fprintf(f, " (Service Signaling)");
+                                } else if (strcmp(root_element, "MMTPackageTable") == 0) {
+                                    fprintf(f, " (MMT Package Table)");
+                                } else if (strcmp(root_element, "ESGData") == 0 || strcmp(root_element, "ESGMain") == 0) {
+                                    fprintf(f, " (Electronic Service Guide)");
+                                } else if (strcmp(root_element, "ContentAdvisoryTable") == 0) {
+                                    fprintf(f, " (Content Advisory)");
+                                }
+                            }
+                        }
+                    }
+                    fprintf(f, "<br>");
+                }
+                
+                fprintf(f, "Hex: ");
+                int hex_len = entry->sample_payload_len > 24 ? 24 : entry->sample_payload_len;
+                for (int j = 0; j < hex_len; j++) {
+                    fprintf(f, "%02X ", entry->sample_payload[j]);
+                }
+                if (entry->sample_payload_len > 24) fprintf(f, "...");
+            } else if (is_xml) {
+                fprintf(f, "<strong>XML data</strong><br>");
+                
+                // Try to identify the XML root element and table type
+                char* xml_str = (char*)entry->sample_payload;
+                int xml_len = entry->sample_payload_len;
+                
+                // Find the root element (skip past <?xml ...?>)
+                char* root_start = strstr(xml_str, "?>");
+                if (root_start && root_start < xml_str + xml_len - 2) {
+                    root_start += 2;
+                    // Skip whitespace
+                    while (root_start < xml_str + xml_len && (*root_start == ' ' || *root_start == '\n' || *root_start == '\r' || *root_start == '\t')) {
+                        root_start++;
+                    }
+                    if (*root_start == '<') {
+                        root_start++;
+                        // Extract element name (up to space, >, or end)
+                        char root_element[64] = {0};
+                        int k = 0;
+                        while (root_start < xml_str + xml_len && k < 63 && 
+                               *root_start != ' ' && *root_start != '>' && *root_start != '\n' && *root_start != '/') {
+                            root_element[k++] = *root_start++;
+                        }
+                        root_element[k] = '\0';
+                        
+                        if (strlen(root_element) > 0) {
+                            fprintf(f, "Root: <strong>&lt;%s&gt;</strong>", root_element);
+                            
+                            // Identify known table types
+                            if (strcmp(root_element, "SLT") == 0) {
+                                fprintf(f, " (Service List Table)");
+                            } else if (strcmp(root_element, "S-TSID") == 0) {
+                                fprintf(f, " (ROUTE Stream Description)");
+                            } else if (strcmp(root_element, "MPD") == 0) {
+                                fprintf(f, " (DASH Manifest)");
+                            } else if (strcmp(root_element, "USBD") == 0 || strcmp(root_element, "BundleDescriptionROUTE") == 0) {
+                                fprintf(f, " (User Service Bundle Description)");
+                            } else if (strcmp(root_element, "USD") == 0) {
+                                fprintf(f, " (User Service Description)");
+                            } else if (strcmp(root_element, "HELD") == 0) {
+                                fprintf(f, " (HTML Entry Locations)");
+                            } else if (strcmp(root_element, "RRT") == 0) {
+                                fprintf(f, " (Rating Region Table)");
+                            } else if (strcmp(root_element, "SystemTime") == 0) {
+                                fprintf(f, " (System Time)");
+                            } else if (strcmp(root_element, "AEAT") == 0) {
+                                fprintf(f, " (Advanced Emergency Alert)");
+                            } else if (strcmp(root_element, "OnscreenMessageNotification") == 0) {
+                                fprintf(f, " (Onscreen Message)");
+                            } else if (strcmp(root_element, "CAP") == 0 || strcmp(root_element, "alert") == 0) {
+                                fprintf(f, " (Common Alerting Protocol)");
+                            } else if (strcmp(root_element, "metadataEnvelope") == 0) {
+                                fprintf(f, " (Service Signaling)");
+                            } else if (strcmp(root_element, "MMTPackageTable") == 0) {
+                                fprintf(f, " (MMT Package Table)");
+                            } else if (strcmp(root_element, "ESGData") == 0 || strcmp(root_element, "ESGMain") == 0) {
+                                fprintf(f, " (Electronic Service Guide)");
+                            } else if (strcmp(root_element, "ContentAdvisoryTable") == 0) {
+                                fprintf(f, " (Content Advisory)");
+                            } else if (strcmp(root_element, "CDT") == 0) {
+                                fprintf(f, " (Caption Distribution Table)");
+                            } else if (strcmp(root_element, "DCT") == 0) {
+                                fprintf(f, " (Dedicated Channel Table)");
+                            }
+                            fprintf(f, "<br>");
+                        }
+                    }
+                }
+                
+                // Show preview
+                fprintf(f, "<code>");
+                int preview_len = entry->sample_payload_len > 100 ? 100 : entry->sample_payload_len;
+                for (int j = 0; j < preview_len; j++) {
+                    char c = entry->sample_payload[j];
+                    if (c == '<') fprintf(f, "&lt;");
+                    else if (c == '>') fprintf(f, "&gt;");
+                    else if (c == '&') fprintf(f, "&amp;");
+                    else if (c >= 0x20 || c == '\n') fputc(c, f);
+                }
+                if (entry->sample_payload_len > 100) fprintf(f, "...");
+                fprintf(f, "</code>");
+            } else if (looks_like_text) {
+                fprintf(f, "<strong>Text data</strong><br><code>");
+                int preview_len = entry->sample_payload_len > 80 ? 80 : entry->sample_payload_len;
+                for (int j = 0; j < preview_len; j++) {
+                    char c = entry->sample_payload[j];
+                    if (c == '<') fprintf(f, "&lt;");
+                    else if (c == '>') fprintf(f, "&gt;");
+                    else if (c == '&') fprintf(f, "&amp;");
+                    else fputc(c, f);
+                }
+                if (entry->sample_payload_len > 80) fprintf(f, "...");
+                fprintf(f, "</code>");
+            } else {
+                // Binary data - try to identify specific formats
+                fprintf(f, "<strong>Binary data</strong><br>");
+                
+                // Check for LCT header (ROUTE/ALC)
+                if (entry->sample_payload_len >= 4) {
+                    uint8_t lct_version = (entry->sample_payload[0] >> 4) & 0x0F;
+                    uint8_t header_len = (entry->sample_payload[2] >> 4) * 4; // In 32-bit words
+                    uint8_t codepoint = entry->sample_payload[3];
+                    
+                    if (lct_version == 1 && header_len >= 8 && header_len <= 64) {
+                        fprintf(f, "<em>Possible LCT Header:</em> Version=%d, HDR_LEN=%d bytes, Codepoint=%d<br>", 
+                                lct_version, header_len, codepoint);
+                    }
+                }
+                
+                // Check for RTP header
+                if (entry->sample_payload_len >= 12) {
+                    uint8_t rtp_version = (entry->sample_payload[0] >> 6) & 0x03;
+                    uint8_t rtp_pt = entry->sample_payload[1] & 0x7F;
+                    if (rtp_version == 2) {
+                        fprintf(f, "<em>Possible RTP:</em> Payload Type=%d", rtp_pt);
+                        if (rtp_pt == 33) {
+                            fprintf(f, " (MP2T/MPEG-TS)");
+                            // Check if RTP payload is MPEG-TS null packets
+                            if (entry->sample_payload_len >= 15) {
+                                uint8_t ts_sync = entry->sample_payload[12];
+                                uint16_t ts_pid = ((entry->sample_payload[13] & 0x1F) << 8) | entry->sample_payload[14];
+                                if (ts_sync == 0x47 && ts_pid == 0x1FFF) {
+                                    fprintf(f, "<br><span style='color:#856404;'>⚠️ RTP carrying MPEG-TS Null/Stuffing packets</span>");
+                                }
+                            }
+                        }
+                        else if (rtp_pt == 96) fprintf(f, " (Dynamic)");
+                        fprintf(f, "<br>");
+                    }
+                }
+                
+                // Check for Scoreboard (1B F4 Signature)
+                if (entry->sample_payload_len >= 5) {
+                    // Check for the specific header bytes: 0x1B (ESC) and 0xF4
+                    if (entry->sample_payload[0] == 0x1B && entry->sample_payload[1] == 0xF4) {
+                        
+                        fprintf(f, "<em>Possible Scoreboard Data:</em> Signature=0x1BF4");
+
+                        // Based on your logs, Byte 4 contains the payload length
+                        if (entry->sample_payload_len >= 5) {
+                            uint8_t internal_len = entry->sample_payload[4];
+                            uint8_t cmd_id = entry->sample_payload[2];
+                            fprintf(f, " Cmd=0x%02X InternalLen=%d", cmd_id, internal_len);
+                        }
+
+                        // Optional: Heuristic to detect ASCII time (e.g., "12:00") inside the packet
+                        // This checks if the payload contains a colon character
+                        int has_time = 0;
+                        for (size_t i = 5; i < entry->sample_payload_len; i++) {
+                            if (entry->sample_payload[i] == 0x3A) { // Hex for ':'
+                                has_time = 1;
+                                break;
+                            }
+                        }
+                        if (has_time) fprintf(f, " <span style='color:#28a745;'>(Contains Clock/Time)</span>");
+                        
+                        fprintf(f, "<br>");
+                    }
+                }
+                
+                // Scan for embedded XML anywhere in payload
+                char* xml_start = NULL;
+                for (int j = 0; j < entry->sample_payload_len - 5; j++) {
+                    if (memcmp(entry->sample_payload + j, "<?xml", 5) == 0) {
+                        xml_start = (char*)(entry->sample_payload + j);
+                        break;
+                    }
+                }
+                
+                if (xml_start) {
+                    int xml_remaining = entry->sample_payload_len - (xml_start - (char*)entry->sample_payload);
+                    fprintf(f, "Contains embedded XML: ");
+                    
+                    // Find root element
+                    char* root_start = strstr(xml_start, "?>");
+                    if (root_start && root_start < xml_start + xml_remaining - 2) {
+                        root_start += 2;
+                        while (root_start < xml_start + xml_remaining && (*root_start == ' ' || *root_start == '\n' || *root_start == '\r' || *root_start == '\t')) {
+                            root_start++;
+                        }
+                        if (*root_start == '<') {
+                            root_start++;
+                            char root_element[64] = {0};
+                            int k = 0;
+                            while (root_start < xml_start + xml_remaining && k < 63 && 
+                                   *root_start != ' ' && *root_start != '>' && *root_start != '\n' && *root_start != '/') {
+                                root_element[k++] = *root_start++;
+                            }
+                            root_element[k] = '\0';
+                            
+                            if (strlen(root_element) > 0) {
+                                fprintf(f, "<strong>&lt;%s&gt;</strong>", root_element);
+                                
+                                // Identify known table types
+                                if (strcmp(root_element, "SLT") == 0) {
+                                    fprintf(f, " (Service List Table)");
+                                } else if (strcmp(root_element, "S-TSID") == 0) {
+                                    fprintf(f, " (ROUTE Stream Description)");
+                                } else if (strcmp(root_element, "MPD") == 0) {
+                                    fprintf(f, " (DASH Manifest)");
+                                } else if (strcmp(root_element, "USBD") == 0 || strcmp(root_element, "BundleDescriptionROUTE") == 0) {
+                                    fprintf(f, " (User Service Bundle Description)");
+                                } else if (strcmp(root_element, "USD") == 0) {
+                                    fprintf(f, " (User Service Description)");
+                                } else if (strcmp(root_element, "HELD") == 0) {
+                                    fprintf(f, " (HTML Entry Locations)");
+                                } else if (strcmp(root_element, "RRT") == 0) {
+                                    fprintf(f, " (Rating Region Table)");
+                                } else if (strcmp(root_element, "SystemTime") == 0) {
+                                    fprintf(f, " (System Time)");
+                                } else if (strcmp(root_element, "AEAT") == 0) {
+                                    fprintf(f, " (Advanced Emergency Alert)");
+                                } else if (strcmp(root_element, "CAP") == 0 || strcmp(root_element, "alert") == 0) {
+                                    fprintf(f, " (Common Alerting Protocol)");
+                                } else if (strcmp(root_element, "metadataEnvelope") == 0) {
+                                    fprintf(f, " (Service Signaling)");
+                                } else if (strcmp(root_element, "MMTPackageTable") == 0) {
+                                    fprintf(f, " (MMT Package Table)");
+                                } else if (strcmp(root_element, "ESGData") == 0 || strcmp(root_element, "ESGMain") == 0) {
+                                    fprintf(f, " (Electronic Service Guide)");
+                                }
+                            }
+                        }
+                    }
+                    fprintf(f, "<br>");
+                }
+                
+                fprintf(f, "Hex: ");
+                int hex_len = entry->sample_payload_len > 32 ? 32 : entry->sample_payload_len;
+                for (int j = 0; j < hex_len; j++) {
+                    fprintf(f, "%02X ", entry->sample_payload[j]);
+                }
+                if (entry->sample_payload_len > 32) fprintf(f, "...");
+            }
+        } else {
+            fprintf(f, "<em>No sample captured</em>");
+        }
+        
+        // Add notes inline if applicable
+        if (entry->tsi_or_packet_id == 0xFFFFFFFF) {
+            fprintf(f, "<br><span style='color:#856404;'>⚠️ TSI 0xFFFFFFFF (reserved/special value)</span>");
+        } else if (entry->tsi_or_packet_id == 0) {
+            fprintf(f, "<br><span style='color:#856404;'>ℹ️ TSI 0 typically indicates signaling</span>");
+        }
+        
+        fprintf(f, "</td></tr>\n");
+    }
+    
+    fprintf(f, "</tbody></table>\n");
+    fprintf(f, "</div></details>\n");
 }
 
 // Helper function to find highest resolution video representation
@@ -5585,6 +7348,9 @@ void generate_html_report(const char* filename) {
            ".mpd-summary { background-color: #e7f3ff; border: 1px solid #b3d7ff; padding: 12px; border-radius: 5px; margin-bottom: 0.8em; }\n"
            ".segment-list { padding-left: 20px; list-style-type: disc; }\n"
            ".segment-list li { border: none; background-color: transparent; padding: 2px; margin-bottom: 2px; }\n"
+           ".smt-badge { background: #28a745; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.85em; font-weight: normal; margin-left: 8px; }\n"
+           ".signature-info { background: #f8f9fa; border: 1px solid #28a745; border-radius: 5px; padding: 12px; margin: 10px 0; }\n"
+           ".signature-info h4 { margin: 0 0 10px 0; color: #28a745; }\n"
            "details { border: 1px solid #dee2e6; border-radius: 5px; margin: 1em 0; background-color: #fff; }\n"
            "summary { font-weight: bold; padding: 8px 12px; background-color: #f8f9fa; cursor: pointer; border-bottom: 1px solid #dee2e6; }\n"
            "details[open] > summary { border-bottom: 1px solid #dee2e6; }\n"
@@ -5594,12 +7360,25 @@ void generate_html_report(const char* filename) {
            "</style>\n</head>\n<body>\n<div class='container'>\n");
     fprintf(f, "<h1>RENDER - RabbitEars NextGen Data Evaluator Report - v%s</h1>\n", RENDER_VERSION);
     
+    // Extract SLT BSID for comparison with L1 BSID
+    char slt_bsid_for_compare[16] = "";
+    for (int i = 0; i < g_lls_table_count; i++) {
+        if (g_lls_tables[i].type == TABLE_TYPE_SLT) {
+            SltData* slt_data = (SltData*)g_lls_tables[i].parsed_data;
+            if (slt_data && strlen(slt_data->bsid) > 0) {
+                strncpy(slt_bsid_for_compare, slt_data->bsid, sizeof(slt_bsid_for_compare) - 1);
+                slt_bsid_for_compare[sizeof(slt_bsid_for_compare) - 1] = '\0';
+                break;
+            }
+        }
+    }
+    
     // --- L1 Information Section ---
     if (get_enhanced_l1_signaling_data()) {
-        generate_enhanced_l1_section(f, get_enhanced_l1_signaling_data());
+        generate_enhanced_l1_section(f, get_enhanced_l1_signaling_data(), slt_bsid_for_compare);
     } else if (get_l1_signaling_data()) {
         // Add a function to generate basic L1 section or convert the data
-        generate_basic_l1_section(f, get_l1_signaling_data());
+        generate_basic_l1_section(f, get_l1_signaling_data(), slt_bsid_for_compare);
     } else {
         // If no L1 data is available, show the red message similar to CDT
         fprintf(f, "<div class='details-content' style='margin-top: 1em; padding: 10px; border-radius: 5px; background-color: #f8d7da; border: 1px solid #f5c6cb; color: #721c24;'>\n");
@@ -5791,12 +7570,36 @@ void generate_html_report(const char* filename) {
             }
         }
         
+        // Get L1 BSID for comparison - also track if L1 data exists at all
+        const char* l1_bsid = NULL;
+        int l1_data_exists = 0;
+        if (get_enhanced_l1_signaling_data()) {
+            l1_data_exists = 1;
+            if (strlen(get_enhanced_l1_signaling_data()->l1_bsid) > 0) {
+                l1_bsid = get_enhanced_l1_signaling_data()->l1_bsid;
+            }
+        } else if (get_l1_signaling_data()) {
+            l1_data_exists = 1;
+            if (strlen(get_l1_signaling_data()->l1_bsid) > 0) {
+                l1_bsid = get_l1_signaling_data()->l1_bsid;
+            }
+        }
+        
         // Check if we have LMT data to show PLP column
         int show_plp_column = has_lmt_data();
         
         fprintf(f, "<h2>Service Summary");
         if (strlen(slt_bsid) > 0) {
-            fprintf(f, " <span style='background:#ffff00;'>(SLT BSID: %s)</span>", slt_bsid);
+            // Highlight yellow if L1 data exists and either:
+            // 1. L1 BSID differs from SLT BSID, or
+            // 2. L1 BSID is not set (empty)
+            int bsid_mismatch = l1_data_exists && (!l1_bsid || strcmp(slt_bsid, l1_bsid) != 0);
+            if (bsid_mismatch) {
+                fprintf(f, " <span style='background:#ffff00;' title='SLT BSID does not match L1 BSID (%s)'>(SLT BSID: %s)</span>", 
+                        l1_bsid ? l1_bsid : "Not Set", slt_bsid);
+            } else {
+                fprintf(f, " (SLT BSID: %s)", slt_bsid);
+            }
         }
         fprintf(f, "</h2>\n");
         
@@ -5884,7 +7687,11 @@ void generate_html_report(const char* filename) {
             found_slt = 1;
             slt_instance_count++;
             //SltData* slt_data = (SltData*)g_lls_tables[i].parsed_data;
-            fprintf(f, "<details><summary>Service List Table (SLT) Instance %d - Raw XML</summary>\n", slt_instance_count);
+            fprintf(f, "<details><summary>Service List Table (SLT) Instance %d", slt_instance_count);
+            if (g_lls_tables[i].is_in_smt) {
+                fprintf(f, " <span class='smt-badge' title='This table was delivered in a Signed Multi-Table (SMT)'>🔒 Signed</span>");
+            }
+            fprintf(f, " - Raw XML</summary>\n");
             fprintf(f, "<div class='details-content'><pre>"); // <h4>Raw XML</h4>
             fprintf_escaped_xml(f, g_lls_tables[i].content_id);
             fprintf(f, "</pre></div></details>\n");
@@ -6521,8 +8328,8 @@ void generate_html_report(const char* filename) {
                             SgddEntry* entry = sgdd->entries;
                             while (entry) {
                                 // Convert timestamps
-                                time_t start_ts = atoll(entry->startTime);
-                                time_t end_ts = atoll(entry->endTime);
+                                time_t start_ts = atoll(entry->startTime) - 2208988800LL;
+                                time_t end_ts = atoll(entry->endTime) - 2208988800LL;
                                 struct tm* tm_start = localtime(&start_ts);
                                 struct tm* tm_end = localtime(&end_ts);
                                 char start_str[64], end_str[64];
@@ -6622,17 +8429,20 @@ void generate_html_report(const char* filename) {
                                 EsgScheduleEvent* event = esg_service->schedule;
                                 while(event) {
                                     EsgProgramInfo* prog = merged_programs;
+                                    EsgProgramInfo* matched_prog = NULL;
                                     while(prog) {
                                         if (strcmp(prog->id, event->programId) == 0) {
-                                            schedule_items[schedule_count].event = event;
-                                            schedule_items[schedule_count].program = prog;
-                                            // Parse timestamp (milliseconds since epoch)
-                                            schedule_items[schedule_count].timestamp = atoll(event->startTime) / 1000;
-                                            schedule_count++;
+                                            matched_prog = prog;
                                             break;
                                         }
                                         prog = prog->next;
                                     }
+                                    // Always add the event, even without a matching program
+                                    schedule_items[schedule_count].event = event;
+                                    schedule_items[schedule_count].program = matched_prog;  // May be NULL
+                                    schedule_items[schedule_count].timestamp = atoll(event->startTime) - 2208988800LL;
+                                    schedule_count++;
+                                    
                                     event = event->next;
                                 }
                                 
@@ -6647,7 +8457,7 @@ void generate_html_report(const char* filename) {
                                     }
                                 }
                                 
-                                fprintf(f, "<h5>Schedule:</h5><table><tr><th>Time</th><th>Duration</th><th>Program</th></tr>");
+                                fprintf(f, "<h5>Schedule:</h5><table><tr><th>Time</th><th><nobr>Duration</nobr></th><th>Program</th></tr>");
                                 for (int s = 0; s < schedule_count; s++) {
                                     time_t ts = schedule_items[s].timestamp;
                                     struct tm* tm_info = localtime(&ts);
@@ -6659,8 +8469,19 @@ void generate_html_report(const char* filename) {
                                         schedule_items[s].event->programId;
                                     const char* prog_desc = schedule_items[s].program ? schedule_items[s].program->description : "";
                                     
-                                    fprintf(f, "<tr><td>%s</td><td>%s</td><td><strong>%s</strong>", 
-                                        time_str, schedule_items[s].event->duration, prog_title);
+                                    // Convert seconds to human-readable duration
+                                    int dur_seconds = atoi(schedule_items[s].event->duration);
+                                    int hours = dur_seconds / 3600;
+                                    int minutes = (dur_seconds % 3600) / 60;
+                                    char dur_str[32];
+                                    if (hours > 0) {
+                                        snprintf(dur_str, sizeof(dur_str), "%dh %dm", hours, minutes);
+                                    } else {
+                                        snprintf(dur_str, sizeof(dur_str), "%dm", minutes);
+                                    }
+                                    
+                                    fprintf(f, "<tr><td><nobr>%s</nobr></td><td><nobr>%s</nobr></td><td><strong>%s</strong>", 
+                                        time_str, dur_str, prog_title);
                                     if (strlen(prog_desc) > 0) {
                                         fprintf(f, "<br><small>%s</small>", prog_desc);
                                     }
@@ -6869,27 +8690,167 @@ void generate_html_report(const char* filename) {
                     case TABLE_TYPE_STSID: {
                         stsid_count++;
                         StsidData* stsid_data = (StsidData*)g_lls_tables[j].parsed_data;
-                        fprintf(f, "<details><summary>S-TSID (Stream Description) Instance %d</summary>\n", stsid_count);
-                        fprintf(f, "<div class='details-content'><h4>ROUTE Stream: %s:%s</h4><table>\n<thead><tr><th>TSI</th><th>Representation ID</th><th>Content Type</th><th>Content Ratings</th></tr></thead>\n<tbody>\n", stsid_data->dIpAddr, stsid_data->dPort);
-                        StsidLogicalStream* ls = stsid_data->head_ls;
-                        while(ls) {
-                             fprintf(f, "<tr><td>%s</td><td>%s</td><td>%s</td><td>", ls->tsi, ls->repId, ls->contentType);
-                             ContentRatingInfo* rating = ls->head_rating;
-                             if (!rating) {
-                                 fprintf(f, "N/A");
-                             } else {
-                                 while(rating) {
-                                     fprintf_escaped_xml(f, rating->value);
-                                     fprintf(f, "<br>");
-                                     rating = rating->next;
-                                 }
-                             }
-                             fprintf(f, "</td></tr>\n");
-                            ls = ls->next;
+                        
+                        // Check if this S-TSID has streaming content (audio/video/captions)
+                        // vs true file delivery content (not init/media segments)
+                        int has_streaming_content = 0;
+                        int has_file_delivery = 0;
+                        StsidLogicalStream* check_ls = stsid_data->head_ls;
+                        while (check_ls) {
+                            if (check_ls->contentType[0] != '\0') {
+                                has_streaming_content = 1;
+                            }
+                            // Check for true file delivery (not streaming init/media segments)
+                            // Init segments (.m4i, _init.) and media segments (.m4s) are part of streaming
+                            if (check_ls->head_file) {
+                                StsidFileEntry* f_check = check_ls->head_file;
+                                while (f_check) {
+                                    // Skip if it looks like a streaming segment
+                                    int is_streaming_segment = 
+                                        (strstr(f_check->content_location, ".m4i") != NULL) ||
+                                        (strstr(f_check->content_location, ".m4s") != NULL) ||
+                                        (strstr(f_check->content_location, "_init.") != NULL) ||
+                                        (strstr(f_check->content_location, "init.mp4") != NULL);
+                                    
+                                    if (!is_streaming_segment && f_check->content_location[0]) {
+                                        has_file_delivery = 1;
+                                        break;
+                                    }
+                                    f_check = f_check->next;
+                                }
+                            }
+                            if (has_file_delivery) break;
+                            check_ls = check_ls->next;
                         }
-                        fprintf(f, "</tbody></table><h4>Raw XML</h4><pre>");
+                        
+                        // Print header with file icon if file delivery present
+                        fprintf(f, "<details><summary>S-TSID (Stream Description) Instance %d", stsid_count);
+                        if (has_file_delivery) {
+                            fprintf(f, " 📁");
+                        }
+                        fprintf(f, "</summary>\n");
+                        
+                        // Only show ROUTE Session line if we have at least an IP
+                        if (stsid_data->dIpAddr[0]) {
+                            fprintf(f, "<div class='details-content'><h4>ROUTE Session: %s", stsid_data->dIpAddr);
+                            if (stsid_data->dPort[0]) {
+                                fprintf(f, ":%s", stsid_data->dPort);
+                            }
+                            fprintf(f, "</h4>\n");
+                        } else {
+                            fprintf(f, "<div class='details-content'>\n");
+                        }
+                        
+                        StsidLogicalStream* ls = stsid_data->head_ls;
+                        // For streaming content, show the traditional table format
+                        if (has_streaming_content) {
+                            fprintf(f, "<table>\n<thead><tr><th>TSI</th><th>Representation ID</th><th>Content Type</th><th>Content Ratings</th></tr></thead>\n<tbody>\n");
+                            ls = stsid_data->head_ls;
+                            while(ls) {
+                                // Only show streams with MediaInfo (streaming content)
+                                if (ls->contentType[0] != '\0' || ls->repId[0] != '\0') {
+                                    fprintf(f, "<tr><td>%s</td><td>%s</td><td>%s</td><td>", 
+                                            ls->tsi, 
+                                            ls->repId[0] ? ls->repId : "N/A", 
+                                            ls->contentType[0] ? ls->contentType : "N/A");
+                                    ContentRatingInfo* rating = ls->head_rating;
+                                    if (!rating) {
+                                        fprintf(f, "N/A");
+                                    } else {
+                                        while(rating) {
+                                            fprintf_escaped_xml(f, rating->value);
+                                            if (rating->next) fprintf(f, "<br>");
+                                            rating = rating->next;
+                                        }
+                                    }
+                                    fprintf(f, "</td></tr>\n");
+                                }
+                                ls = ls->next;
+                            }
+                            fprintf(f, "</tbody></table>\n");
+                        }
+                        
+                        // For true file delivery content, show file manifests
+                        if (has_file_delivery) {
+                            ls = stsid_data->head_ls;
+                            while(ls) {
+                                if (ls->head_file) {
+                                    // Count non-streaming files
+                                    int real_file_count = 0;
+                                    uint64_t total_size = 0;
+                                    StsidFileEntry* f_count = ls->head_file;
+                                    while (f_count) {
+                                        int is_streaming_segment = 
+                                            (strstr(f_count->content_location, ".m4i") != NULL) ||
+                                            (strstr(f_count->content_location, ".m4s") != NULL) ||
+                                            (strstr(f_count->content_location, "_init.") != NULL) ||
+                                            (strstr(f_count->content_location, "init.mp4") != NULL);
+                                        if (!is_streaming_segment && f_count->content_location[0]) {
+                                            real_file_count++;
+                                            total_size += f_count->content_length;
+                                        }
+                                        f_count = f_count->next;
+                                    }
+                                    
+                                    if (real_file_count > 0) {
+                                        fprintf(f, "<h5>📁 File Delivery (TSI: %s) - %d file%s</h5>\n", 
+                                                ls->tsi, real_file_count, real_file_count == 1 ? "" : "s");
+                                        fprintf(f, "<table>\n<thead><tr><th>TOI</th><th>Filename</th><th>Size</th><th>Type</th></tr></thead>\n<tbody>\n");
+                                        StsidFileEntry* file = ls->head_file;
+                                        while (file) {
+                                            // Skip streaming segments
+                                            int is_streaming_segment = 
+                                                (strstr(file->content_location, ".m4i") != NULL) ||
+                                                (strstr(file->content_location, ".m4s") != NULL) ||
+                                                (strstr(file->content_location, "_init.") != NULL) ||
+                                                (strstr(file->content_location, "init.mp4") != NULL);
+                                            
+                                            if (!is_streaming_segment && file->content_location[0]) {
+                                                // Format size nicely
+                                                char size_str[32];
+                                                if (file->content_length >= 1073741824) {
+                                                    snprintf(size_str, sizeof(size_str), "%.2f GB", file->content_length / 1073741824.0);
+                                                } else if (file->content_length >= 1048576) {
+                                                    snprintf(size_str, sizeof(size_str), "%.2f MB", file->content_length / 1048576.0);
+                                                } else if (file->content_length >= 1024) {
+                                                    snprintf(size_str, sizeof(size_str), "%.2f KB", file->content_length / 1024.0);
+                                                } else if (file->content_length > 0) {
+                                                    snprintf(size_str, sizeof(size_str), "%lu B", (unsigned long)file->content_length);
+                                                } else {
+                                                    snprintf(size_str, sizeof(size_str), "N/A");
+                                                }
+                                                
+                                                fprintf(f, "<tr><td>%u</td><td>", file->toi);
+                                                fprintf_escaped_xml(f, file->content_location);
+                                                fprintf(f, "</td><td>%s</td><td>%s</td></tr>\n", 
+                                                        size_str, 
+                                                        file->content_type[0] ? file->content_type : "N/A");
+                                            }
+                                            file = file->next;
+                                        }
+                                        fprintf(f, "</tbody></table>\n");
+                                        
+                                        // Show total size if we have any
+                                        if (total_size > 0) {
+                                            char total_str[32];
+                                            if (total_size >= 1073741824) {
+                                                snprintf(total_str, sizeof(total_str), "%.2f GB", total_size / 1073741824.0);
+                                            } else if (total_size >= 1048576) {
+                                                snprintf(total_str, sizeof(total_str), "%.2f MB", total_size / 1048576.0);
+                                            } else {
+                                                snprintf(total_str, sizeof(total_str), "%.2f KB", total_size / 1024.0);
+                                            }
+                                            fprintf(f, "<p><em>Total: %s</em></p>\n", total_str);
+                                        }
+                                    }
+                                }
+                                ls = ls->next;
+                            }
+                        }
+                        
+                        fprintf(f, "<details><summary>Raw XML</summary><pre>");
                         fprintf_escaped_xml(f, g_lls_tables[j].content_id);
-                        fprintf(f, "</pre></div></details>\n");
+                        fprintf(f, "</pre></details></div></details>\n");
                         break;
                     }
                     case TABLE_TYPE_MP_TABLE_XML: {
@@ -6958,6 +8919,12 @@ void generate_html_report(const char* filename) {
             }
         }
 
+        // Check for eGPS data associated with this service
+        EgpsData* egps = find_egps_data(service->slsDestinationIpAddress, service->slsDestinationUdpPort);
+        if (egps && render_egps_html(f, egps)) {
+            found_items_for_service = 1;
+        }
+
         // Check for MMT Stream Parameters (VSPD, ASPD, CAD descriptors)
         // This is similar to how we display MPD for ROUTE services
         
@@ -7014,6 +8981,21 @@ void generate_html_report(const char* filename) {
                 case TABLE_TYPE_SYSTEM_TIME:
                     should_print_this_table = 1;
                     break;
+                case TABLE_TYPE_RRT:
+                    should_print_this_table = 1;
+                    break;
+                case TABLE_TYPE_SIGNATURE:
+                    should_print_this_table = 1;
+                    break;
+                case TABLE_TYPE_UDS:
+                    should_print_this_table = 1;
+                    break;
+                case TABLE_TYPE_AEAT:
+                    should_print_this_table = 1;
+                    break;
+                case TABLE_TYPE_UNHANDLED:
+                    should_print_this_table = 1;
+                    break;
                 default:
                     break;
             }
@@ -7029,7 +9011,7 @@ void generate_html_report(const char* filename) {
                 switch(g_lls_tables[i].type) {
                     case TABLE_TYPE_UCT: {
                         UctData* uct_data = (UctData*)g_lls_tables[i].parsed_data;
-                        fprintf(f, "<details><summary>User Content Table (UCT / NDP)</summary><div class='details-content'>\n");
+                        fprintf(f, "<details><summary>📦 User Content Table (UCT / NDP)</summary><div class='details-content'>\n");
                         NdPackage* package = uct_data->head_package;
                         while(package) {
                             fprintf(f, "<h3>Package: %s (IP: %s:%s)</h3>\n", package->name, package->dstIP, package->dstPort);
@@ -7048,7 +9030,61 @@ void generate_html_report(const char* filename) {
                         // This check is technically redundant now, but it's safe to keep.
                         if (udst_linked_flags[i] == 0) { 
                             UdstData* udst_data = (UdstData*)g_lls_tables[i].parsed_data;
-                            fprintf(f, "<details><summary>Unlinked User Defined Service Table (UDST)</summary><div class='details-content'>\n");
+                            fprintf(f, "<details><summary>📡 Unlinked User Defined Service Table (UDST)</summary><div class='details-content'>\n");
+                            
+                            // Display UDS entries (uses shared UdsData structure)
+                            UdsData* uds = udst_data->head_uds;
+                            while (uds) {
+                                fprintf(f, "<div style='border:1px solid #ddd;margin:10px 0;padding:10px;border-radius:5px;'>\n");
+                                fprintf(f, "<h4 style='margin-top:0;'>📡 %s</h4>\n", 
+                                        uds->name[0] ? uds->name : "User Defined Stream");
+                                fprintf(f, "<table>\n<tbody>\n");
+                                if (uds->contextId[0]) {
+                                    fprintf(f, "<tr><td><strong>Context ID</strong></td><td>%s</td></tr>\n", uds->contextId);
+                                }
+                                if (uds->destIP[0]) {
+                                    fprintf(f, "<tr><td><strong>Destination</strong></td><td>%s:%s</td></tr>\n", 
+                                            uds->destIP, uds->destPort);
+                                }
+                                if (uds->maxBitrate[0]) {
+                                    long bitrate = atol(uds->maxBitrate);
+                                    if (bitrate >= 1000000) {
+                                        fprintf(f, "<tr><td><strong>Max Bitrate</strong></td><td>%.1f Mbps</td></tr>\n", bitrate / 1000000.0);
+                                    } else if (bitrate >= 1000) {
+                                        fprintf(f, "<tr><td><strong>Max Bitrate</strong></td><td>%.1f Kbps</td></tr>\n", bitrate / 1000.0);
+                                    } else {
+                                        fprintf(f, "<tr><td><strong>Max Bitrate</strong></td><td>%s bps</td></tr>\n", uds->maxBitrate);
+                                    }
+                                }
+                                fprintf(f, "</tbody></table>\n");
+                                
+                                // Show sample payload if collected
+                                if (uds->sample_collected && uds->sample_payload_len > 0) {
+                                    fprintf(f, "<p><strong>Sample Payload:</strong> ");
+                                    // Quick format detection
+                                    int is_mpeg_ts = (uds->sample_payload_len >= 1 && uds->sample_payload[0] == 0x47);
+                                    if (is_mpeg_ts) {
+                                        uint16_t pid = ((uds->sample_payload[1] & 0x1F) << 8) | uds->sample_payload[2];
+                                        fprintf(f, "MPEG-TS (PID 0x%04X)", pid);
+                                    } else {
+                                        fprintf(f, "Binary");
+                                    }
+                                    fprintf(f, "<br><code style='font-size:10px;'>");
+                                    int hex_len = uds->sample_payload_len > 32 ? 32 : uds->sample_payload_len;
+                                    for (int j = 0; j < hex_len; j++) {
+                                        fprintf(f, "%02X ", uds->sample_payload[j]);
+                                    }
+                                    if (uds->sample_payload_len > 32) fprintf(f, "...");
+                                    fprintf(f, "</code></p>\n");
+                                } else {
+                                    fprintf(f, "<p><em>No sample payload captured (stream may not be active)</em></p>\n");
+                                }
+                                
+                                fprintf(f, "</div>\n");
+                                uds = uds->next;
+                            }
+                            
+                            // Display BroadSpan services (complex format)
                             BroadSpanServiceInfo* bss_info = udst_data->head_service;
                             while(bss_info) {
                                 RsrvInfo* rsrv = bss_info->head_rsrv;
@@ -7075,7 +9111,11 @@ void generate_html_report(const char* filename) {
                             if (g_lls_tables[i].type == TABLE_TYPE_SYSTEM_TIME) {
                                 found_system_time = 1;
                                 SystemTimeData* time_data = (SystemTimeData*)g_lls_tables[i].parsed_data;
-                                fprintf(f, "<details><summary>System Time Details - Actual Timestamp in L1Detail</summary><div class='details-content'>\n");
+                                fprintf(f, "<details><summary>🕐 System Time Details");
+                                if (g_lls_tables[i].is_in_smt) {
+                                    fprintf(f, " <span class='smt-badge' title='This table was delivered in a Signed Multi-Table (SMT)'>🔒 Signed</span>");
+                                }
+                                fprintf(f, " - Actual Timestamp in L1Detail</summary><div class='details-content'>\n");
                                 fprintf(f, "<table>\n<thead><tr><th>Attribute</th><th>Value</th></tr></thead>\n<tbody>\n");
                                 if (time_data->currentUtcOffset[0] != '\0') { fprintf(f, "<tr><td>currentUtcOffset</td><td>%s</td></tr>\n", time_data->currentUtcOffset); }
                                 if (time_data->ptpPrepend[0] != '\0') { fprintf(f, "<tr><td>ptpPrepend</td><td>%s</td></tr>\n", time_data->ptpPrepend); }
@@ -7096,6 +9136,385 @@ void generate_html_report(const char* filename) {
                             fprintf(f, "<details><summary>System Time Details - Not Found</summary>\n");
                             fprintf(f, "<div class='details-content'><p class='not-found'>No System Time tables found in this capture.</p></div></details>\n");
                         }
+                        break;
+                    }
+                    case TABLE_TYPE_RRT: {
+                        RrtData* rrt = (RrtData*)g_lls_tables[i].parsed_data;
+                        if (rrt) {
+                            fprintf(f, "<details><summary>🔞 Rating Region Table (RRT)");
+                            if (g_lls_tables[i].is_in_smt) {
+                                fprintf(f, " <span class='smt-badge' title='This table was delivered in a Signed Multi-Table (SMT)'>🔒 Signed</span>");
+                            }
+                            fprintf(f, "</summary>\n");
+                            fprintf(f, "<div class='details-content'>\n");
+                            
+                            if (rrt->num_regions == 0) {
+                                fprintf(f, "<p class='not-found'>No rating regions found in RRT.</p>\n");
+                            } else {
+                                RrtRegion* region = rrt->regions;
+                                while (region) {
+                                    // Get region name - use ID-based lookup if name not provided
+                                    const char* region_display_name = region->region_name;
+                                    char region_name_buf[64];
+                                    if (region_display_name[0] == '\0') {
+                                        switch (region->region_id) {
+                                            case 1: region_display_name = "United States"; break;
+                                            case 2: region_display_name = "Canada"; break;
+                                            default:
+                                                snprintf(region_name_buf, sizeof(region_name_buf), "Region %d", region->region_id);
+                                                region_display_name = region_name_buf;
+                                        }
+                                    }
+                                    
+                                    fprintf(f, "<h4>📺 %s (Region ID: %d)</h4>\n", region_display_name, region->region_id);
+                                    
+                                    if (region->num_dimensions == 0) {
+                                        fprintf(f, "<p>No rating dimensions defined.</p>\n");
+                                    } else {
+                                        RrtDimension* dim = region->dimensions;
+                                        while (dim) {
+                                            fprintf(f, "<div style='margin: 10px 0; padding: 10px; background: #f8f9fa; border-radius: 5px;'>\n");
+                                            fprintf(f, "<strong>%s</strong>", dim->dimension_name);
+                                            if (dim->graduated_scale) {
+                                                fprintf(f, " <em>(graduated scale)</em>");
+                                            }
+                                            fprintf(f, "<br>\n");
+                                            
+                                            if (dim->num_values > 0) {
+                                                fprintf(f, "<span style='color: #666;'>Values: </span>");
+                                                RrtRatingValue* val = dim->values;
+                                                int first = 1;
+                                                while (val) {
+                                                    if (!first) fprintf(f, ", ");
+                                                    first = 0;
+                                                    
+                                                    if (val->abbrev_name[0] != '\0') {
+                                                        fprintf(f, "<strong>%s</strong>", val->abbrev_name);
+                                                        if (val->full_name[0] != '\0' && strcmp(val->abbrev_name, val->full_name) != 0) {
+                                                            fprintf(f, " (%s)", val->full_name);
+                                                        }
+                                                    } else if (val->full_name[0] != '\0') {
+                                                        fprintf(f, "%s", val->full_name);
+                                                    }
+                                                    val = val->next;
+                                                }
+                                                fprintf(f, "\n");
+                                            }
+                                            fprintf(f, "</div>\n");
+                                            dim = dim->next;
+                                        }
+                                    }
+                                    region = region->next;
+                                }
+                            }
+                            
+                            fprintf(f, "<details><summary>Raw XML</summary><pre>");
+                            fprintf_escaped_xml(f, g_lls_tables[i].content_id);
+                            fprintf(f, "</pre></details>\n");
+                            fprintf(f, "</div></details>\n");
+                        }
+                        break;
+                    }
+                    case TABLE_TYPE_SIGNATURE: {
+                        SignatureData* sig = (SignatureData*)g_lls_tables[i].parsed_data;
+                        if (sig) {
+                            fprintf(f, "<details><summary>🔐 SMT Signature Block</summary>\n");
+                            fprintf(f, "<div class='details-content signature-info'>\n");
+                            fprintf(f, "<table>\n<thead><tr><th>Attribute</th><th>Value</th></tr></thead>\n<tbody>\n");
+                            fprintf(f, "<tr><td>Signature Length</td><td>%d bytes</td></tr>\n", sig->signature_len);
+                            fprintf(f, "<tr><td>Algorithm</td><td>%s</td></tr>\n", sig->algorithm_name);
+                            fprintf(f, "<tr><td>Tables Covered</td><td>%d</td></tr>\n", sig->tables_covered);
+                            fprintf(f, "<tr><td>Valid CMS Structure</td><td>%s</td></tr>\n", sig->is_cms_valid ? "Yes" : "Unknown");
+                            fprintf(f, "</tbody></table>\n");
+                            fprintf(f, "</div></details>\n");
+                        }
+                        break;
+                    }
+                    case TABLE_TYPE_UDS: {
+                        UdsData* uds = (UdsData*)g_lls_tables[i].parsed_data;
+                        if (uds) {
+                            fprintf(f, "<details><summary>📡 User Defined Stream (UDS)");
+                            if (uds->name[0]) {
+                                fprintf(f, ": %s", uds->name);
+                            }
+                            fprintf(f, "</summary>\n");
+                            fprintf(f, "<div class='details-content'>\n");
+                            fprintf(f, "<table>\n<thead><tr><th>Attribute</th><th>Value</th></tr></thead>\n<tbody>\n");
+                            if (uds->contextId[0]) {
+                                fprintf(f, "<tr><td>Context ID</td><td>%s</td></tr>\n", uds->contextId);
+                            }
+                            if (uds->destIP[0]) {
+                                fprintf(f, "<tr><td>Destination</td><td>%s:%s</td></tr>\n", uds->destIP, uds->destPort);
+                            }
+                            if (uds->maxBitrate[0]) {
+                                // Format bitrate nicely
+                                long bitrate = atol(uds->maxBitrate);
+                                if (bitrate >= 1000000) {
+                                    fprintf(f, "<tr><td>Max Bitrate</td><td>%.1f Mbps</td></tr>\n", bitrate / 1000000.0);
+                                } else if (bitrate >= 1000) {
+                                    fprintf(f, "<tr><td>Max Bitrate</td><td>%.1f Kbps</td></tr>\n", bitrate / 1000.0);
+                                } else {
+                                    fprintf(f, "<tr><td>Max Bitrate</td><td>%s bps</td></tr>\n", uds->maxBitrate);
+                                }
+                            }
+                            fprintf(f, "</tbody></table>\n");
+                            
+                            // Show sample payload if collected with analysis
+                            if (uds->sample_collected && uds->sample_payload_len > 0) {
+                                fprintf(f, "<h4>Sample Payload Analysis</h4>\n");
+                                fprintf(f, "<p style='font-family:monospace;font-size:11px;'>");
+                                
+                                // Try to identify payload type
+                                int is_gzip = (uds->sample_payload_len >= 2 && 
+                                              uds->sample_payload[0] == 0x1f && uds->sample_payload[1] == 0x8b);
+                                int is_xml = (uds->sample_payload_len >= 5 && 
+                                             memcmp(uds->sample_payload, "<?xml", 5) == 0);
+                                int is_mpeg_ts = (uds->sample_payload_len >= 1 && uds->sample_payload[0] == 0x47);
+                                
+                                if (is_gzip) {
+                                    fprintf(f, "<strong>GZIP compressed data</strong><br>");
+                                    int decomp_size = 0;
+                                    int consumed = 0;
+                                    char* decomp = decompress_gzip(uds->sample_payload, uds->sample_payload_len, &decomp_size, &consumed);
+                                    if (decomp && decomp_size > 0) {
+                                        if (decomp_size >= 5 && memcmp(decomp, "<?xml", 5) == 0) {
+                                            fprintf(f, "Contains XML data<br>");
+                                        }
+                                        int preview_len = decomp_size > 80 ? 80 : decomp_size;
+                                        fprintf(f, "Decompressed: <code>");
+                                        for (int j = 0; j < preview_len; j++) {
+                                            char c = decomp[j];
+                                            if (c == '<') fprintf(f, "&lt;");
+                                            else if (c == '>') fprintf(f, "&gt;");
+                                            else if (c == '&') fprintf(f, "&amp;");
+                                            else if (c >= 0x20 || c == '\n') fputc(c, f);
+                                            else fprintf(f, ".");
+                                        }
+                                        if (decomp_size > 80) fprintf(f, "...");
+                                        fprintf(f, "</code>");
+                                        free(decomp);
+                                    }
+                                } else if (is_xml) {
+                                    fprintf(f, "<strong>XML data</strong><br><code>");
+                                    int preview_len = uds->sample_payload_len > 100 ? 100 : uds->sample_payload_len;
+                                    for (int j = 0; j < preview_len; j++) {
+                                        char c = uds->sample_payload[j];
+                                        if (c == '<') fprintf(f, "&lt;");
+                                        else if (c == '>') fprintf(f, "&gt;");
+                                        else if (c == '&') fprintf(f, "&amp;");
+                                        else if (c >= 0x20 || c == '\n') fputc(c, f);
+                                    }
+                                    if (uds->sample_payload_len > 100) fprintf(f, "...");
+                                    fprintf(f, "</code>");
+                                } else if (is_mpeg_ts) {
+                                    uint16_t pid = ((uds->sample_payload[1] & 0x1F) << 8) | uds->sample_payload[2];
+                                    fprintf(f, "<strong>MPEG-TS</strong> (PID 0x%04X", pid);
+                                    if (pid == 0x1FFF) fprintf(f, " - Null/Stuffing");
+                                    fprintf(f, ")<br>");
+                                    fprintf(f, "Hex: ");
+                                    int hex_len = uds->sample_payload_len > 32 ? 32 : uds->sample_payload_len;
+                                    for (int j = 0; j < hex_len; j++) {
+                                        fprintf(f, "%02X ", uds->sample_payload[j]);
+                                    }
+                                    if (uds->sample_payload_len > 32) fprintf(f, "...");
+                                } else {
+                                    // Check for RTP
+                                    if (uds->sample_payload_len >= 12) {
+                                        uint8_t rtp_version = (uds->sample_payload[0] >> 6) & 0x03;
+                                        uint8_t rtp_pt = uds->sample_payload[1] & 0x7F;
+                                        if (rtp_version == 2) {
+                                            fprintf(f, "<em>Possible RTP:</em> Payload Type=%d", rtp_pt);
+                                            if (rtp_pt == 33) fprintf(f, " (MP2T/MPEG-TS)");
+                                            fprintf(f, "<br>");
+                                        }
+                                    }
+                                    fprintf(f, "Hex: ");
+                                    int hex_len = uds->sample_payload_len > 48 ? 48 : uds->sample_payload_len;
+                                    for (int j = 0; j < hex_len; j++) {
+                                        fprintf(f, "%02X ", uds->sample_payload[j]);
+                                    }
+                                    if (uds->sample_payload_len > 48) fprintf(f, "...");
+                                }
+                                fprintf(f, "</p>\n");
+                            } else {
+                                fprintf(f, "<p><em>No sample payload captured (stream may not be active)</em></p>\n");
+                            }
+                            
+                            // Raw XML
+                            fprintf(f, "<details><summary>Raw XML</summary><pre>");
+                            fprintf_escaped_xml(f, g_lls_tables[i].content_id);
+                            fprintf(f, "</pre></details>\n");
+                            
+                            fprintf(f, "</div></details>\n");
+                        }
+                        break;
+                    }
+                    case TABLE_TYPE_AEAT: {
+                        AeatData* aeat = (AeatData*)g_lls_tables[i].parsed_data;
+                        if (aeat) {
+                            fprintf(f, "<details><summary>🚨 Advanced Emergency Alert Table (AEAT) - %d alert%s</summary>\n", 
+                                    aeat->aea_count, aeat->aea_count != 1 ? "s" : "");
+                            fprintf(f, "<div class='details-content'>\n");
+                            
+                            AeaEntry* aea = aeat->head_aea;
+                            int alert_num = 0;
+                            while (aea) {
+                                alert_num++;
+                                // Color code by priority
+                                const char* priority_color = "#666";
+                                const char* priority_bg = "#f8f9fa";
+                                if (aea->priority[0]) {
+                                    int p = atoi(aea->priority);
+                                    if (p == 1) { priority_color = "#fff"; priority_bg = "#dc3545"; }  // Red - Extreme
+                                    else if (p == 2) { priority_color = "#000"; priority_bg = "#fd7e14"; }  // Orange - Severe
+                                    else if (p == 3) { priority_color = "#000"; priority_bg = "#ffc107"; }  // Yellow - Moderate
+                                    else if (p == 4) { priority_color = "#000"; priority_bg = "#17a2b8"; }  // Blue - Minor
+                                }
+                                
+                                fprintf(f, "<div style='border:1px solid #ddd;margin:10px 0;padding:10px;border-radius:5px;'>\n");
+                                fprintf(f, "<h4 style='margin-top:0;background:%s;color:%s;padding:8px;border-radius:3px;'>", 
+                                        priority_bg, priority_color);
+                                if (aea->eventDesc[0]) {
+                                    fprintf(f, "%s", aea->eventDesc);
+                                } else {
+                                    fprintf(f, "Alert #%d", alert_num);
+                                }
+                                if (aea->eventCode[0]) {
+                                    fprintf(f, " <span style='font-weight:normal;'>(%s)</span>", aea->eventCode);
+                                }
+                                fprintf(f, "</h4>\n");
+                                
+                                fprintf(f, "<table>\n<tbody>\n");
+                                if (aea->issuer[0]) {
+                                    fprintf(f, "<tr><td><strong>Issuer</strong></td><td>%s</td></tr>\n", aea->issuer);
+                                }
+                                if (aea->category[0]) {
+                                    fprintf(f, "<tr><td><strong>Category</strong></td><td>%s</td></tr>\n", aea->category);
+                                }
+                                if (aea->audience[0]) {
+                                    fprintf(f, "<tr><td><strong>Audience</strong></td><td>%s</td></tr>\n", aea->audience);
+                                }
+                                if (aea->priority[0]) {
+                                    const char* priority_desc = "";
+                                    int p = atoi(aea->priority);
+                                    if (p == 1) priority_desc = " (Extreme)";
+                                    else if (p == 2) priority_desc = " (Severe)";
+                                    else if (p == 3) priority_desc = " (Moderate)";
+                                    else if (p == 4) priority_desc = " (Minor)";
+                                    else if (p == 5) priority_desc = " (Unknown)";
+                                    fprintf(f, "<tr><td><strong>Priority</strong></td><td>%s%s</td></tr>\n", aea->priority, priority_desc);
+                                }
+                                if (aea->wakeup[0]) {
+                                    fprintf(f, "<tr><td><strong>Wakeup</strong></td><td>%s%s</td></tr>\n", 
+                                            aea->wakeup, 
+                                            strcmp(aea->wakeup, "true") == 0 ? " ⏰ (device should wake)" : "");
+                                }
+                                if (aea->effective[0]) {
+                                    fprintf(f, "<tr><td><strong>Effective</strong></td><td>%s</td></tr>\n", aea->effective);
+                                }
+                                if (aea->expires[0]) {
+                                    fprintf(f, "<tr><td><strong>Expires</strong></td><td>%s</td></tr>\n", aea->expires);
+                                }
+                                if (aea->eventCode[0]) {
+                                    fprintf(f, "<tr><td><strong>Event Code</strong></td><td>%s", aea->eventCode);
+                                    if (aea->eventCodeType[0]) {
+                                        fprintf(f, " (%s)", aea->eventCodeType);
+                                    }
+                                    fprintf(f, "</td></tr>\n");
+                                }
+                                if (aea->location[0]) {
+                                    fprintf(f, "<tr><td><strong>Location</strong></td><td>%s", aea->location);
+                                    if (aea->locationType[0]) {
+                                        fprintf(f, " (%s)", aea->locationType);
+                                    }
+                                    fprintf(f, "</td></tr>\n");
+                                }
+                                fprintf(f, "</tbody></table>\n");
+                                
+                                // Alert text
+                                if (aea->aeaText[0]) {
+                                    fprintf(f, "<div style='background:#f8f9fa;padding:10px;margin:10px 0;border-left:4px solid %s;'>", priority_bg);
+                                    fprintf(f, "<strong>Alert Message:</strong><br>%s</div>\n", aea->aeaText);
+                                }
+                                
+                                // Media attachments
+                                if (aea->head_media) {
+                                    fprintf(f, "<h5>Media Attachments</h5>\n");
+                                    fprintf(f, "<table>\n<thead><tr><th>Type</th><th>Description</th><th>File</th><th>Size</th></tr></thead>\n<tbody>\n");
+                                    AeatMedia* media = aea->head_media;
+                                    while (media) {
+                                        fprintf(f, "<tr><td>%s</td><td>%s</td><td><code>%s</code></td><td>", 
+                                                media->contentType[0] ? media->contentType : "—",
+                                                media->mediaDesc[0] ? media->mediaDesc : "—",
+                                                media->url[0] ? media->url : "—");
+                                        if (media->contentLength[0]) {
+                                            long len = atol(media->contentLength);
+                                            if (len >= 1048576) {
+                                                fprintf(f, "%.1f MB", len / 1048576.0);
+                                            } else if (len >= 1024) {
+                                                fprintf(f, "%.1f KB", len / 1024.0);
+                                            } else {
+                                                fprintf(f, "%s bytes", media->contentLength);
+                                            }
+                                        } else {
+                                            fprintf(f, "—");
+                                        }
+                                        fprintf(f, "</td></tr>\n");
+                                        media = media->next;
+                                    }
+                                    fprintf(f, "</tbody></table>\n");
+                                }
+                                
+                                // Technical details (collapsed)
+                                fprintf(f, "<details><summary>Technical Details</summary>\n");
+                                fprintf(f, "<table>\n<tbody>\n");
+                                if (aea->aeaId[0]) {
+                                    fprintf(f, "<tr><td>AEA ID</td><td><code>%s</code></td></tr>\n", aea->aeaId);
+                                }
+                                if (aea->aeaType[0]) {
+                                    fprintf(f, "<tr><td>Type</td><td>%s</td></tr>\n", aea->aeaType);
+                                }
+                                if (aea->audience[0]) {
+                                    fprintf(f, "<tr><td>Audience</td><td>%s</td></tr>\n", aea->audience);
+                                }
+                                fprintf(f, "</tbody></table>\n</details>\n");
+                                
+                                fprintf(f, "</div>\n");
+                                aea = aea->next;
+                            }
+                            
+                            // Raw XML
+                            fprintf(f, "<details><summary>Raw XML</summary><pre>");
+                            fprintf_escaped_xml(f, g_lls_tables[i].content_id);
+                            fprintf(f, "</pre></details>\n");
+                            
+                            fprintf(f, "</div></details>\n");
+                        }
+                        break;
+                    }
+                    case TABLE_TYPE_UNHANDLED: {
+                        UnhandledTableData* unhandled = (UnhandledTableData*)g_lls_tables[i].parsed_data;
+                        if (unhandled) {
+                            fprintf(f, "<details><summary>❓ Unhandled Table: &lt;%s&gt;", unhandled->root_element);
+                            if (g_lls_tables[i].is_in_smt) {
+                                fprintf(f, " <span class='smt-badge' title='This table was delivered in a Signed Multi-Table (SMT)'>🔒 Signed</span>");
+                            }
+                            fprintf(f, "</summary>\n");
+                            fprintf(f, "<div class='details-content'>\n");
+                            fprintf(f, "<p style='color: #856404; background: #fff3cd; padding: 10px; border-radius: 5px;'>"
+                                       "This table type is recognized but not fully parsed by RENDER.</p>\n");
+                            fprintf(f, "<table>\n<thead><tr><th>Attribute</th><th>Value</th></tr></thead>\n<tbody>\n");
+                            fprintf(f, "<tr><td>Root Element</td><td><code>&lt;%s&gt;</code></td></tr>\n", unhandled->root_element);
+                            if (unhandled->namespace_uri[0] != '\0') {
+                                fprintf(f, "<tr><td>Namespace</td><td><code>%s</code></td></tr>\n", unhandled->namespace_uri);
+                            }
+                            fprintf(f, "</tbody></table>\n");
+                            fprintf(f, "<details><summary>Raw XML</summary><pre>");
+                            fprintf_escaped_xml(f, g_lls_tables[i].content_id);
+                            fprintf(f, "</pre></details>\n");
+                            fprintf(f, "</div></details>\n");
+                        }
+                        break;
                     }
                     default: break;
                 }
@@ -7104,12 +9523,29 @@ void generate_html_report(const char* filename) {
         
     }
     
+    // --- Unknown Services Section ---
+    // Check if there are any unknown services first
+    int has_unknown_services = 0;
+    for (int i = 0; i < g_data_usage_count; i++) {
+        const char* svc_name = get_service_name_for_destination(g_data_usage[i].destinationIp, g_data_usage[i].destinationPort);
+        if (!svc_name && !g_data_usage[i].is_lls && !g_data_usage[i].is_signaling && 
+            strcmp(g_data_usage[i].stream_type, "Stuffing") != 0) {
+            has_unknown_services = 1;
+            break;
+        }
+    }
+    if (has_unknown_services) {
+        fprintf(f, "<h2>Unknown Services</h2>\n");
+        fprintf(f, "<p>The following streams were detected but could not be associated with any service in the SLT or LLS.</p>\n");
+        generate_unknown_service_analysis(f);
+    }
+    
     // --- Input Info Section ---
     fprintf(f, "<h2>Input Info</h2>\n");
     fprintf(f, "<table>\n<thead><tr><th>Attribute</th><th>Value</th></tr></thead>\n<tbody>\n");
     
     // Input type
-    fprintf(f, "<tr><td><strong>Input Type</strong></td><td>%s</td></tr>\n", get_input_type_string(g_input_type));
+    fprintf(f, "<tr><td><strong>Input Type</strong></td><td>%s</td></tr>\n", get_input_type_string(g_original_input_type));
     
     // File name
     fprintf(f, "<tr><td><strong>File Name</strong></td><td>%s</td></tr>\n", g_input_filename);
@@ -7180,6 +9616,9 @@ void cleanup() {
     free_reassembly_buffers();
     free_bps_data(g_bps_data);
     g_bps_data = NULL;
+    
+    // Free eGPS data
+    free_all_egps_data();
     
     if (get_enhanced_l1_signaling_data()) {
         free_enhanced_l1_signaling_data(get_enhanced_l1_signaling_data());
@@ -7352,8 +9791,57 @@ void free_parsed_data(LlsTable* table) {
         case TABLE_TYPE_SYSTEM_TIME:
         case TABLE_TYPE_SIGNATURE:
         case TABLE_TYPE_DWD: // Placeholder, just free the main struct
+        case TABLE_TYPE_UNHANDLED: // Simple struct, just free it
+        case TABLE_TYPE_UDS: // Simple struct with inline arrays
             free(table->parsed_data);
             break;
+        case TABLE_TYPE_EGPS:
+            free_egps_data((EgpsData*)table->parsed_data);
+            break;
+        case TABLE_TYPE_AEAT: {
+            AeatData* aeat_data = (AeatData*)table->parsed_data;
+            if (aeat_data) {
+                AeaEntry* aea = aeat_data->head_aea;
+                while (aea) {
+                    AeaEntry* next_aea = aea->next;
+                    AeatMedia* media = aea->head_media;
+                    while (media) {
+                        AeatMedia* next_media = media->next;
+                        free(media);
+                        media = next_media;
+                    }
+                    free(aea);
+                    aea = next_aea;
+                }
+                free(aeat_data);
+            }
+            break;
+        }
+        case TABLE_TYPE_RRT: {
+            RrtData* rrt_data = (RrtData*)table->parsed_data;
+            if (rrt_data) {
+                RrtRegion* region = rrt_data->regions;
+                while (region) {
+                    RrtRegion* next_region = region->next;
+                    RrtDimension* dim = region->dimensions;
+                    while (dim) {
+                        RrtDimension* next_dim = dim->next;
+                        RrtRatingValue* val = dim->values;
+                        while (val) {
+                            RrtRatingValue* next_val = val->next;
+                            free(val);
+                            val = next_val;
+                        }
+                        free(dim);
+                        dim = next_dim;
+                    }
+                    free(region);
+                    region = next_region;
+                }
+                free(rrt_data);
+            }
+            break;
+        }
         case TABLE_TYPE_LMT: {
             LmtData* lmt_data = (LmtData*)table->parsed_data;
             if (lmt_data) {
@@ -7510,6 +9998,12 @@ void free_stsid_data(StsidData* data) {
             free(current_rating);
             current_rating = next_rating;
         }
+        StsidFileEntry* current_file = current_ls->head_file;
+        while (current_file != NULL) {
+            StsidFileEntry* next_file = current_file->next;
+            free(current_file);
+            current_file = next_file;
+        }
         StsidLogicalStream* next_ls = current_ls->next;
         free(current_ls);
         current_ls = next_ls;
@@ -7556,6 +10050,16 @@ void free_uct_data(UctData* data) {
  */
 void free_udst_data(UdstData* data) {
     if (!data) return;
+    
+    // Free UDS entries
+    UdsData* uds = data->head_uds;
+    while (uds != NULL) {
+        UdsData* next_uds = uds->next;
+        free(uds);
+        uds = next_uds;
+    }
+    
+    // Free BroadSpan services
     BroadSpanServiceInfo* current_svc = data->head_service;
     while (current_svc != NULL) {
         if (current_svc->head_rsrv) {

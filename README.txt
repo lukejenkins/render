@@ -1,4 +1,4 @@
-RENDER - RabbitEars NextGen Data Evaluator and Reporter - v0.2
+RENDER - RabbitEars NextGen Data Evaluator and Reporter - v0.3
 
 RENDER is software written using Google Gemini and Anthropic Claude to parse
 ATSC 3.0 signals and output them in an HTML format, similar to the TSReader
@@ -24,36 +24,58 @@ Packets:
 - HDHomeRun Debug
 - IPv4-PCAP
 - ALP-PCAP
+- STLTP-PCAP (partial)
 
 Text:
 - HDHomeRun plpinfo format
 - HDHomeRun l1detail format
 - HDHomeRun TUI text output format
 
-Both the packet data and the text data are needed for full information.  The 
-ideal set of information is the ALP-PCAP combined with either the l1detail or
-the HDHomeRun TUI text output from an HDHomeRun with the Dev upgrade.  These 
-items together should have the same name, and provide all the information 
-that the software can currently parse.
+Unless the provided data is in STLTP-PCAP format, both the packet data and 
+the text data are needed for full information.  The ideal set of information
+at present is the ALP-PCAP combined with either the l1detail or the HDHomeRun
+TUI text output from an HDHomeRun with the Dev upgrade.  These items together
+should have the same name, and provide all the information that the software
+can currently parse.
 
 It supports or mostly supports the following ATSC 3.0 functions and 
 parameters:
 
 - PLP Information (if any Text available)
 - L1 Basic and L1 Detail (if l1detail or TUI text/Dev available)
-- Link Mapping Table (if ALP-PCAP)
+- Link Mapping Table (if ALP-PCAP or STLTP-PCAP)
 - Service List Table
 - Capability Descriptor Table, which is Signal Signing
 - Broadcast Positioning System
 - ROUTE-based audio/video and data streams
-- System Time information
-- Basic data usage analysis
+- Most other LLS tables, including AEAT, RRT, SMT, etc
+- Basic info on MPEG-TS packets
+- Basic data usage analysis (other than bitrates)
+- Minimal eGPS support
+- Partial ESG support
 
-These functions are known to be significantly incomplete or non-functional:
+These functions are known to be have issues, or be significantly incomplete 
+or non-functional:
 
-- MMT-based audio/video and data streams
-- ESG support - Guide data chunks are present but not organized
-- Bitrate calculations
+- __STLTP__ - While the STLTP parsing does work, there are currently bugs 
+that prevent it from fully parsing all packets.  It is likely a subtle 
+problem with the ALP packet reassembly that has not yet been found.
+- __MMT Media__ - It is believed that the MMT parsing works, but it appears 
+that no station is actually transmitting the signaling necessary to make it 
+actually function properly.  A work-around is implemented but it only gathers
+the audio/video parameters some of the time, and should not be considered
+reliable.
+- __ESG Support__ - Some stations still do not have ESG data showing, or it
+is not showing complete ESG data.  This will continue to be reviewed in the 
+future.
+- __eGPS Support__ - The code displays eGPS raw data, but the data seems to 
+be in a proprietary format with little or no public documentation.  Attempts
+to reverse-engineer the structure beyond minimal header support have been 
+unsuccessful.
+- __Bitrates__ - While the usage chart shows the total data and number of 
+packets in all cases, bitrates are currently unreliable.  For debug and IPv4
+input formats, the necessary data is missing and probably cannot be reverse
+engineered.  For other formats, the calculation has not been validated.
 
 To build on Ubuntu, it is believed you'll need these packages:
 
@@ -85,10 +107,11 @@ result in a PCAP and .txt file with the same name that you can use.
 
 Then just run it:
 
-./render <pcap/debug file name>
+./render <pcap|debug file name>
 
 It'll output an HTML file with the same name that you can then review.  As 
 RENDER is currently highly experimental, if any output looks questionable, 
-please reach out to me:  webmaster@rabbitears.info
+please reach out to me by e-mail (webmaster@rabbitears.info) or on the 
+RabbitEars Discord (https://discord.gg/tnamT4eccd).
 
 Please also reach out with any questions or comments.  Enjoy this tool!

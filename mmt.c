@@ -750,7 +750,7 @@ void process_enhanced_mmt_payload(const u_char* payload, int len, ServiceDestina
                                                    dest_info->destinationPortStr, 
                                                    header.packet_id);
     record_data_usage(dest_info->destinationIpStr, dest_info->destinationPortStr, 
-                     header.packet_id, len, description);
+                     header.packet_id, len, description, NULL, NULL, 0);
     
     log_mmt_packet_id(header.packet_id);
     
@@ -869,7 +869,7 @@ void process_enhanced_mmt_signaling_payload(const uint8_t* buffer, size_t size, 
             
             if (parse_xml(decompressed, decompressed_size, &type, &parsed_data, source_id) == 0 && parsed_data) {
                 printf("Successfully parsed XML table of type %d\n", type);
-                store_unique_table(decompressed, decompressed_size, type, parsed_data, destIp, destPort);
+                store_unique_table(decompressed, decompressed_size, type, parsed_data, destIp, destPort, 0, -1);
                 
                 // If this is a USBD, also extract and store USD tables with proper IP/port
                 if (type == TABLE_TYPE_USBD) {
@@ -890,7 +890,7 @@ void process_enhanced_mmt_signaling_payload(const uint8_t* buffer, size_t size, 
                                     TableType usd_type = TABLE_TYPE_USD;
                                     void* usd_parsed_data = NULL;
                                     if (parse_xml(usd_xml, strlen(usd_xml), &usd_type, &usd_parsed_data, "Nested USD") == 0 && usd_parsed_data) {
-                                        store_unique_table(usd_xml, strlen(usd_xml), TABLE_TYPE_USD, usd_parsed_data, destIp, destPort);
+                                        store_unique_table(usd_xml, strlen(usd_xml), TABLE_TYPE_USD, usd_parsed_data, destIp, destPort, 0, -1);
                                     }
                                     free(usd_xml);
                                 }
@@ -923,7 +923,7 @@ void process_enhanced_mmt_signaling_payload(const uint8_t* buffer, size_t size, 
         
         if (parse_xml((const char*)buffer, size, &type, &parsed_data, source_id) == 0 && parsed_data) {
             printf("Successfully parsed XML table of type %d\n", type);
-            store_unique_table((const char*)buffer, size, type, parsed_data, destIp, destPort);
+            store_unique_table((const char*)buffer, size, type, parsed_data, destIp, destPort, 0, -1);
             
             // If this is a USBD, also extract and store USD tables with proper IP/port
             if (type == TABLE_TYPE_USBD) {
@@ -944,7 +944,7 @@ void process_enhanced_mmt_signaling_payload(const uint8_t* buffer, size_t size, 
                                     TableType usd_type = TABLE_TYPE_USD;
                                     void* usd_parsed_data = NULL;
                                     if (parse_xml(usd_xml, strlen(usd_xml), &usd_type, &usd_parsed_data, "Nested USD") == 0 && usd_parsed_data) {
-                                        store_unique_table(usd_xml, strlen(usd_xml), TABLE_TYPE_USD, usd_parsed_data, destIp, destPort);
+                                        store_unique_table(usd_xml, strlen(usd_xml), TABLE_TYPE_USD, usd_parsed_data, destIp, destPort, 0, -1);
                                         printf("  Extracted and stored nested USD\n");
                                     }
                                     free(usd_xml);
@@ -1054,7 +1054,7 @@ void process_mmt_signaling_payload(const uint8_t* buffer, size_t size, const cha
         void* parsed_data = NULL;
         if (parse_xml((const char*)xml_start, xml_len, &type, &parsed_data, source_id) == 0) {
             if (parsed_data) {
-                store_unique_table((const char*)xml_start, xml_len, type, parsed_data, destIp, destPort);
+                store_unique_table((const char*)xml_start, xml_len, type, parsed_data, destIp, destPort, 0, -1);
             }
         }
     } else {
@@ -1082,7 +1082,7 @@ void process_mmt_signaling_payload(const uint8_t* buffer, size_t size, const cha
             
             if (!already_stored) {
                 store_unique_table(content_id_str, strlen(content_id_str), 
-                                 TABLE_TYPE_MP_TABLE_BINARY, parsed_data, destIp, destPort);
+                                 TABLE_TYPE_MP_TABLE_BINARY, parsed_data, destIp, destPort, 0, -1);
             } else {
                 free_binary_mp_table_data(parsed_data);
             }
@@ -1684,7 +1684,7 @@ int parse_binary_mmt_messages(const uint8_t* buffer, size_t size,
                                     destIp, destPort, mpt_table->version);
                             
                             store_unique_table(content_id, strlen(content_id), 
-                                             TABLE_TYPE_MP_TABLE_BINARY, binary_mpt, destIp, destPort);
+                                             TABLE_TYPE_MP_TABLE_BINARY, binary_mpt, destIp, destPort, 0, -1);
                             
                             printf("Stored Binary MPT with %d asset(s) for display\n", mpt_table->num_assets);
                         } else {
@@ -1821,7 +1821,7 @@ int parse_binary_mmt_messages(const uint8_t* buffer, size_t size,
                     
                     if (parse_xml(decompressed, decompressed_size, &type, &parsed_data, source_id) == 0 && parsed_data) {
                         printf("  Successfully parsed as XML type %d\n", type);
-                        store_unique_table(decompressed, decompressed_size, type, parsed_data, destIp, destPort);
+                        store_unique_table(decompressed, decompressed_size, type, parsed_data, destIp, destPort, 0, -1);
                     }
                 } else {
                     // Parse as binary descriptor
@@ -1886,7 +1886,7 @@ int parse_binary_mmt_messages(const uint8_t* buffer, size_t size,
                                  &parsed_data, source_id) == 0 && parsed_data) {
                         printf("  Successfully parsed as type %d\n", type);
                         store_unique_table(decompressed, decompressed_size, type, 
-                                         parsed_data, destIp, destPort);
+                                         parsed_data, destIp, destPort, 0, -1);
                         was_parsed = true;  // Successfully parsed XML
                         
                         // If this is a USBD, also extract and store USD tables with proper IP/port
@@ -1908,7 +1908,7 @@ int parse_binary_mmt_messages(const uint8_t* buffer, size_t size,
                                             TableType usd_type = TABLE_TYPE_USD;
                                             void* usd_parsed_data = NULL;
                                             if (parse_xml(usd_xml, strlen(usd_xml), &usd_type, &usd_parsed_data, "Nested USD from ATSC3") == 0 && usd_parsed_data) {
-                                                store_unique_table(usd_xml, strlen(usd_xml), TABLE_TYPE_USD, usd_parsed_data, destIp, destPort);
+                                                store_unique_table(usd_xml, strlen(usd_xml), TABLE_TYPE_USD, usd_parsed_data, destIp, destPort, 0, -1);
                                                 printf("    Extracted and stored nested USD\n");
                                             }
                                             free(usd_xml);
@@ -2270,12 +2270,16 @@ void parse_mpi_message_improved(const uint8_t* pos, size_t msg_length,
 }
 
 const char* get_media_type_from_mpt(const char* dest_ip, const char* dest_port, uint32_t packet_id) {
+    int found_mpt_for_dest = 0;
+    
     // Search through MP Table data (both XML and binary)
     for (int i = 0; i < g_lls_table_count; i++) {
         if ((g_lls_tables[i].type == TABLE_TYPE_MP_TABLE_XML ||
              g_lls_tables[i].type == TABLE_TYPE_MP_TABLE_BINARY) &&
             strcmp(g_lls_tables[i].destinationIp, dest_ip) == 0 &&
             strcmp(g_lls_tables[i].destinationPort, dest_port) == 0) {
+            
+            found_mpt_for_dest = 1;  // We found an MP Table for this service
             
             if (g_lls_tables[i].type == TABLE_TYPE_MP_TABLE_XML) {
                 MpTableData* mpt_data = (MpTableData*)g_lls_tables[i].parsed_data;
@@ -2343,10 +2347,12 @@ const char* get_media_type_from_mpt(const char* dest_ip, const char* dest_port, 
     }
     
     // Fallback - guess based on packet ID patterns (common convention)
-    if (packet_id == 0) return "Signaling";
-    if (packet_id >= 256 && packet_id <= 511) return "Video";
-    if (packet_id >= 512 && packet_id <= 767) return "Audio";
-    if (packet_id >= 768) return "Data/Captions";
+    if (found_mpt_for_dest) {
+        if (packet_id == 0) return "Signaling";
+        if (packet_id >= 256 && packet_id <= 511) return "Video";
+        if (packet_id >= 512 && packet_id <= 767) return "Audio";
+        if (packet_id >= 768) return "Data/Captions";
+    }
     
     return "Media";
 }

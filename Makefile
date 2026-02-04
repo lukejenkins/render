@@ -6,13 +6,13 @@ CFLAGS = -Wall -g -Ilibhdhomerun $(shell pkg-config --cflags libxml-2.0 libavcod
 LDFLAGS = $(shell pkg-config --libs libxml-2.0 libavcodec libavutil) -lpcap -lz -lssl -lcrypto -lhdhomerun
 
 # Source files
-SRCS = a3render.c mmt.c input.c plp.c l1_detail_parser.c crypto.c esg.c bps.c utility.c direct_parsers.c
+SRCS = a3render.c mmt.c input.c plp.c l1_detail_parser.c crypto.c esg.c bps.c egps.c utility.c direct_parsers.c
 
 # Object files (automatically derived from SRCS)
 OBJS = $(SRCS:.c=.o)
 
 # Header files (for dependency tracking)
-HEADERS = structures.h mmt.h input.h plp.h l1_detail_parser.h crypto.h esg.h bps.h utility.h direct_parsers.h
+HEADERS = structures.h mmt.h input.h plp.h l1_detail_parser.h crypto.h esg.h bps.h egps.h utility.h direct_parsers.h
 
 # Executable
 TARGET = render

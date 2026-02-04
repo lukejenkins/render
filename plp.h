@@ -169,7 +169,7 @@ void set_l1_signaling_data(L1SignalingData* data);
 EnhancedL1SignalingData* get_enhanced_l1_signaling_data(void);
 void set_enhanced_l1_signaling_data(EnhancedL1SignalingData* data);
 
-void generate_enhanced_l1_section(FILE *f, EnhancedL1SignalingData* data);
-void generate_basic_l1_section(FILE *f, L1SignalingData* data);
+void generate_enhanced_l1_section(FILE *f, EnhancedL1SignalingData* data, const char* slt_bsid);
+void generate_basic_l1_section(FILE *f, L1SignalingData* data, const char* slt_bsid);
 
 #endif // PLP_H

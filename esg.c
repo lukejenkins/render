@@ -423,8 +423,227 @@ void parse_esg_service_bundle(xmlNodePtr bundle_node, EsgFragmentData* esg_data)
 }
 
 void parse_esg_schedule(xmlNodePtr schedule_node, EsgFragmentData* esg_data) {
-    // This would parse standalone schedule fragments
-    // Implementation depends on specific ESG schedule format
+    // ADD THIS DEBUG BLOCK:
+    xmlBufferPtr dbg_buf = xmlBufferCreate();
+    if (dbg_buf) {
+        xmlNodeDump(dbg_buf, schedule_node->doc, schedule_node, 0, 1);
+        printf("DEBUG SCHEDULE XML (first 3000 chars):\n%.3000s\n", (char*)dbg_buf->content);
+        printf("DEBUG SCHEDULE XML total length: %d\n", xmlBufferLength(dbg_buf));
+        xmlBufferFree(dbg_buf);
+    }
+    
+    xmlChar* prop;
+    
+    // Get the service ID this schedule is for
+    char serviceId[128] = {0};
+    
+    // First try attributes on the Schedule element itself
+    prop = xmlGetProp(schedule_node, (const xmlChar *)"serviceIDRef");
+    if (!prop) prop = xmlGetProp(schedule_node, (const xmlChar *)"serviceId");
+    if (!prop) prop = xmlGetProp(schedule_node, (const xmlChar *)"service");
+    if (prop) {
+        strncpy(serviceId, (char*)prop, sizeof(serviceId)-1);
+        xmlFree(prop);
+    }
+    
+    // If not found as attribute, look for ServiceRef/ServiceReference child element (OMA ESG format)
+    if (strlen(serviceId) == 0) {
+        xmlNodePtr ref_child = schedule_node->children;
+        while (ref_child) {
+            if (ref_child->type == XML_ELEMENT_NODE) {
+                if (xmlStrcmp(ref_child->name, (const xmlChar *)"ServiceRef") == 0 ||
+                    xmlStrcmp(ref_child->name, (const xmlChar *)"ServiceReference") == 0) {
+                    prop = xmlGetProp(ref_child, (const xmlChar *)"idRef");
+                    if (!prop) prop = xmlGetProp(ref_child, (const xmlChar *)"ref");
+                    if (!prop) prop = xmlGetProp(ref_child, (const xmlChar *)"serviceId");
+                    if (!prop) prop = xmlGetProp(ref_child, (const xmlChar *)"id");
+                    if (prop) {
+                        strncpy(serviceId, (char*)prop, sizeof(serviceId)-1);
+                        xmlFree(prop);
+                        break;
+                    }
+                }
+            }
+            ref_child = ref_child->next;
+        }
+    }
+    
+    printf("DEBUG: Parsing standalone Schedule fragment for service: %s\n", serviceId);
+    
+    // Find or create the service this schedule belongs to
+    EsgServiceInfo* target_service = NULL;
+    EsgServiceInfo* svc = esg_data->services;
+    while (svc) {
+        if (strcmp(svc->id, serviceId) == 0) {
+            target_service = svc;
+            break;
+        }
+        svc = svc->next;
+    }
+    
+    // If service doesn't exist yet, create a placeholder
+    if (!target_service && strlen(serviceId) > 0) {
+        target_service = calloc(1, sizeof(EsgServiceInfo));
+        if (target_service) {
+            strncpy(target_service->id, serviceId, sizeof(target_service->id)-1);
+            target_service->next = esg_data->services;
+            esg_data->services = target_service;
+        }
+    }
+    
+    if (!target_service) {
+        printf("WARNING: Schedule fragment has no service reference\n");
+        return;
+    }
+    
+    // Parse schedule events - look for ScheduleEvent children
+    EsgScheduleEvent* schedule_tail = target_service->schedule;
+    while (schedule_tail && schedule_tail->next) {
+        schedule_tail = schedule_tail->next;
+    }
+    
+    xmlNodePtr child = schedule_node->children;
+    while (child) {
+        if (child->type == XML_ELEMENT_NODE) {
+            if (xmlStrcmp(child->name, (const xmlChar *)"ScheduleEvent") == 0 ||
+                xmlStrcmp(child->name, (const xmlChar *)"Event") == 0) {
+                
+                EsgScheduleEvent* event = calloc(1, sizeof(EsgScheduleEvent));
+                if (event) {
+                    prop = xmlGetProp(child, (const xmlChar *)"startTime");
+                    if (prop) { 
+                        strncpy(event->startTime, (char*)prop, sizeof(event->startTime)-1);
+                        event->startTime[sizeof(event->startTime)-1] = '\0';
+                        xmlFree(prop); 
+                    }
+                    
+                    prop = xmlGetProp(child, (const xmlChar *)"duration");
+                    if (prop) { 
+                        strncpy(event->duration, (char*)prop, sizeof(event->duration)-1);
+                        event->duration[sizeof(event->duration)-1] = '\0';
+                        xmlFree(prop); 
+                    }
+                    
+                    prop = xmlGetProp(child, (const xmlChar *)"endTime");
+                    if (prop) { 
+                        // Some formats use endTime instead of duration
+                        strncpy(event->duration, (char*)prop, sizeof(event->duration)-1);
+                        event->duration[sizeof(event->duration)-1] = '\0';
+                        xmlFree(prop); 
+                    }
+                    
+                    // Program reference can be in different attributes
+                    prop = xmlGetProp(child, (const xmlChar *)"programIDRef");
+                    if (!prop) prop = xmlGetProp(child, (const xmlChar *)"programId");
+                    if (!prop) prop = xmlGetProp(child, (const xmlChar *)"contentIDRef");
+                    if (prop) { 
+                        strncpy(event->programId, (char*)prop, sizeof(event->programId)-1);
+                        event->programId[sizeof(event->programId)-1] = '\0';
+                        xmlFree(prop); 
+                    }
+                    
+                    // Also check for nested ContentFragmentRef element
+                    xmlNodePtr event_child = child->children;
+                    while (event_child) {
+                        if (event_child->type == XML_ELEMENT_NODE &&
+                            (xmlStrcmp(event_child->name, (const xmlChar *)"ContentFragmentRef") == 0 ||
+                             xmlStrcmp(event_child->name, (const xmlChar *)"ProgramRef") == 0)) {
+                            prop = xmlGetProp(event_child, (const xmlChar *)"idRef");
+                            if (!prop) prop = xmlGetProp(event_child, (const xmlChar *)"id");
+                            if (prop) {
+                                strncpy(event->programId, (char*)prop, sizeof(event->programId)-1);
+                                event->programId[sizeof(event->programId)-1] = '\0';
+                                xmlFree(prop);
+                            }
+                        }
+                        event_child = event_child->next;
+                    }
+                    
+                    printf("DEBUG: Parsed ScheduleEvent: start=%s, duration=%s, programId=%s\n",
+                           event->startTime, event->duration, event->programId);
+                    
+                    // Only add event if it has valid timing data
+                    if (strlen(event->startTime) > 0) {
+                        if (!target_service->schedule) {
+                            target_service->schedule = event;
+                            schedule_tail = event;
+                        } else {
+                            schedule_tail->next = event;
+                            schedule_tail = event;
+                        }
+                    } else {
+                        printf("DEBUG: Skipping ScheduleEvent with empty startTime (likely truncated XML)\n");
+                        free(event);
+                    }
+                }
+            }
+            // Handle OMA ESG ContentReference format with nested PresentationWindow
+            else if (xmlStrcmp(child->name, (const xmlChar *)"ContentReference") == 0) {
+                EsgScheduleEvent* event = calloc(1, sizeof(EsgScheduleEvent));
+                if (event) {
+                    // Get content/program ID from idRef attribute
+                    prop = xmlGetProp(child, (const xmlChar *)"idRef");
+                    if (!prop) prop = xmlGetProp(child, (const xmlChar *)"id");
+                    if (prop) { 
+                        strncpy(event->programId, (char*)prop, sizeof(event->programId)-1);
+                        event->programId[sizeof(event->programId)-1] = '\0';
+                        xmlFree(prop); 
+                    }
+                    
+                    // Look for PresentationWindow child to get timing info
+                    xmlNodePtr pw = child->children;
+                    while (pw) {
+                        if (pw->type == XML_ELEMENT_NODE &&
+                            xmlStrcmp(pw->name, (const xmlChar *)"PresentationWindow") == 0) {
+                            prop = xmlGetProp(pw, (const xmlChar *)"startTime");
+                            if (prop) { 
+                                strncpy(event->startTime, (char*)prop, sizeof(event->startTime)-1);
+                                event->startTime[sizeof(event->startTime)-1] = '\0';
+                                xmlFree(prop); 
+                            }
+                            
+                            prop = xmlGetProp(pw, (const xmlChar *)"duration");
+                            if (prop) { 
+                                strncpy(event->duration, (char*)prop, sizeof(event->duration)-1);
+                                event->duration[sizeof(event->duration)-1] = '\0';
+                                xmlFree(prop); 
+                            }
+                            
+                            prop = xmlGetProp(pw, (const xmlChar *)"endTime");
+                            if (prop) { 
+                                // Store endTime in duration field if no duration (can convert later)
+                                if (strlen(event->duration) == 0) {
+                                    strncpy(event->duration, (char*)prop, sizeof(event->duration)-1);
+                                    event->duration[sizeof(event->duration)-1] = '\0';
+                                }
+                                xmlFree(prop); 
+                            }
+                            break;
+                        }
+                        pw = pw->next;
+                    }
+                    
+                    printf("DEBUG: Parsed ContentReference: start=%s, duration=%s, contentId=%s\n",
+                           event->startTime, event->duration, event->programId);
+                    
+                    // Only add event if it has valid timing data
+                    if (strlen(event->startTime) > 0) {
+                        if (!target_service->schedule) {
+                            target_service->schedule = event;
+                            schedule_tail = event;
+                        } else {
+                            schedule_tail->next = event;
+                            schedule_tail = event;
+                        }
+                    } else {
+                        printf("DEBUG: Skipping ContentReference with empty startTime (likely truncated XML)\n");
+                        free(event);
+                    }
+                }
+            }
+        }
+        child = child->next;
+    }
 }
 
 SgddData* parse_sgdd(xmlDocPtr doc) {

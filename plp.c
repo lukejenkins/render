@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
 #include "plp.h"
 #include "l1_detail_parser.h"
 
@@ -974,7 +975,7 @@ void free_enhanced_l1_signaling_data(EnhancedL1SignalingData* data) {
     free(data);
 }
 
-void generate_enhanced_l1_section(FILE *f, EnhancedL1SignalingData* data) {
+void generate_enhanced_l1_section(FILE *f, EnhancedL1SignalingData* data, const char* slt_bsid) {
     if (!data) return;
     
     // Count PLPs for the summary
@@ -985,11 +986,16 @@ void generate_enhanced_l1_section(FILE *f, EnhancedL1SignalingData* data) {
         count_plp = count_plp->next;
     }
     
-    // Create BSID display
+    // Create BSID display - only highlight if it differs from SLT BSID
     char bsid_display[128] = "";
     if (strlen(data->l1_bsid) > 0) {
-        snprintf(bsid_display, sizeof(bsid_display), " <span style='background:#ffff00;'>(L1 BSID: %s)</span>", 
-                 data->l1_bsid);
+        int bsid_mismatch = (slt_bsid && strlen(slt_bsid) > 0 && strcmp(data->l1_bsid, slt_bsid) != 0);
+        if (bsid_mismatch) {
+            snprintf(bsid_display, sizeof(bsid_display), " <span style='background:#ffff00;' title='L1 BSID does not match SLT BSID (%s)'>(L1 BSID: %s)</span>", 
+                     slt_bsid, data->l1_bsid);
+        } else {
+            snprintf(bsid_display, sizeof(bsid_display), " (L1 BSID: %s)", data->l1_bsid);
+        }
     } else {
         snprintf(bsid_display, sizeof(bsid_display), " <span style='background:#ffff00;'>(L1 BSID: Not Set)</span>");
     }
@@ -1134,45 +1140,75 @@ void generate_enhanced_l1_section(FILE *f, EnhancedL1SignalingData* data) {
     has_l1_details = has_base64 || has_l1basic || has_l1detail || has_plp_details;
     
     if (has_l1_details) {
-        fprintf(f, "<details><summary>L1 Signaling Details ");
-        if (has_base64) { fprintf(f, "(From L1Detail)"); }
-        else { fprintf(f, "(From Text File)"); }
-        fprintf(f, "</summary>\n");
-        fprintf(f, "<div class='details-content'>\n");
+        // Parse the L1 data first (if base64 available) so we can extract the timestamp for the header
+        struct l1_detail_info* detail_info = NULL;
+        unsigned char *decoded_data = NULL;
+        char l1d_time_str[64] = "";
         
-        // If we have base64 data, try to decode and parse it
         if (has_base64) {
             size_t decoded_len = b64_decoded_size_l1(data->l1_base64);
-            unsigned char *decoded_data = malloc(decoded_len);
+            decoded_data = malloc(decoded_len);
             
             if (decoded_data && b64_decode_l1(data->l1_base64, decoded_data, decoded_len)) {
-                // Create a temporary structure to hold the parsed data
-                struct l1_detail_info* detail_info = create_l1_detail_info(MAX_DISPLAY_LINES);
+                detail_info = create_l1_detail_info(MAX_DISPLAY_LINES);
                 if (detail_info) {
                     // Parse the L1 data
                     parse_l1_data_l1(decoded_data, decoded_len, detail_info->display_lines, 
                                      &detail_info->line_count, detail_info->max_lines, &detail_info->context);
                     
-                    // Display the parsed data
-                    fprintf(f, "<div style='font-family: monospace; font-size: 12px; background-color: #f8f9fa; padding: 10px; border-radius: 4px; margin: 10px 0;'>\n");
+                    // Search display lines for L1D_time_sec to extract timestamp
                     for (int i = 0; i < detail_info->line_count; i++) {
-                        if (strcmp(detail_info->display_lines[i], "__HLINE__") == 0) {
-                            fprintf(f, "<strong style='color: #0066cc;'>================================================================================</strong><br>\n");
-                        } else {
-                            fprintf_escaped_xml(f, detail_info->display_lines[i]);
-                            fprintf(f, "<br>\n");
+                        char* time_pos = strstr(detail_info->display_lines[i], "L1D_time_sec:");
+                        if (time_pos) {
+                            long unix_time = 0;
+                            if (sscanf(time_pos, "L1D_time_sec: %ld", &unix_time) == 1 && unix_time > 0) {
+                                time_t time_val = (time_t)unix_time;
+                                struct tm *tm_info = localtime(&time_val);
+                                if (tm_info) {
+                                    strftime(l1d_time_str, sizeof(l1d_time_str), "%Y-%m-%d %H:%M:%S %Z", tm_info);
+                                }
+                            }
+                            break;
                         }
                     }
-                    fprintf(f, "</div>\n");
-                    
-                    free_l1_detail_info(detail_info);
                 }
             }
-            
-            if (decoded_data) {
-                free(decoded_data);
+        }
+        
+        // Now write the header with timestamp if we found one
+        fprintf(f, "<details><summary>L1 Signaling Details ");
+        if (has_base64) { fprintf(f, "(From L1Detail)"); }
+        else { fprintf(f, "(From Text File)"); }
+        
+        if (strlen(l1d_time_str) > 0) {
+            fprintf(f, " - %s", l1d_time_str);
+        }
+        
+        fprintf(f, "</summary>\n");
+        fprintf(f, "<div class='details-content'>\n");
+        
+        // If we have parsed base64 data, display it
+        if (detail_info) {
+            // Display the parsed data
+            fprintf(f, "<div style='font-family: monospace; font-size: 12px; background-color: #f8f9fa; padding: 10px; border-radius: 4px; margin: 10px 0;'>\n");
+            for (int i = 0; i < detail_info->line_count; i++) {
+                if (strcmp(detail_info->display_lines[i], "__HLINE__") == 0) {
+                    fprintf(f, "<strong style='color: #0066cc;'>================================================================================</strong><br>\n");
+                } else {
+                    fprintf_escaped_xml(f, detail_info->display_lines[i]);
+                    fprintf(f, "<br>\n");
+                }
             }
-        } else {
+            fprintf(f, "</div>\n");
+            
+            free_l1_detail_info(detail_info);
+        }
+        
+        if (decoded_data) {
+            free(decoded_data);
+        }
+        
+        if (!has_base64) {
             // No base64 data available, show original text file content
             fprintf(f, "<div style='font-family: monospace; font-size: 12px; background-color: #f8f9fa; padding: 10px; border-radius: 4px; margin: 10px 0;'>\n");
             
@@ -1291,7 +1327,7 @@ void generate_enhanced_l1_section(FILE *f, EnhancedL1SignalingData* data) {
                     }
                 }
 
-void generate_basic_l1_section(FILE *f, L1SignalingData* data) {
+void generate_basic_l1_section(FILE *f, L1SignalingData* data, const char* slt_bsid) {
     if (!data) return;
     
     int plp_count = 0;
@@ -1301,11 +1337,16 @@ void generate_basic_l1_section(FILE *f, L1SignalingData* data) {
         count_plp = count_plp->next;
     }
     
-    // Create summary text for the collapsible header
+    // Create summary text for the collapsible header - only highlight if BSID differs from SLT
     char l1_summary[256] = "";
     if (strlen(data->l1_bsid) > 0) {
-        snprintf(l1_summary, sizeof(l1_summary), " <span style='background:#ffff00;'>(L1 BSID: %s)</span>", 
-                 data->l1_bsid);
+        int bsid_mismatch = (slt_bsid && strlen(slt_bsid) > 0 && strcmp(data->l1_bsid, slt_bsid) != 0);
+        if (bsid_mismatch) {
+            snprintf(l1_summary, sizeof(l1_summary), " <span style='background:#ffff00;' title='L1 BSID does not match SLT BSID (%s)'>(L1 BSID: %s)</span>", 
+                     slt_bsid, data->l1_bsid);
+        } else {
+            snprintf(l1_summary, sizeof(l1_summary), " (L1 BSID: %s)", data->l1_bsid);
+        }
     } else {
         snprintf(l1_summary, sizeof(l1_summary), " <span style='background:#ffff00;'>(L1 BSID: Not Set)</span>");
     }

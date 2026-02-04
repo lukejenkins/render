@@ -423,7 +423,7 @@ void generate_cdt_html_section(FILE *f, int g_lls_table_count, LlsTable* g_lls_t
             if (g_lls_tables[i].type == TABLE_TYPE_CDT) {
                 CdtData* cdt_data = (CdtData*)g_lls_tables[i].parsed_data;
                 // Green highlight applied to the summary tag for CDT presence
-                fprintf(f, "<details><summary style='background-color: #d4edda; border: 1px solid #c3e6cb; color: #155724; border-radius: 4px; '>Capability Descriptor Table (CDT) - %d Certificate(s)</summary><div class='details-content'>", cdt_data->certificate_count);
+                fprintf(f, "<details><summary style='background-color: #d4edda; border: 1px solid #c3e6cb; color: #155724; border-radius: 4px; '>Certification Data Table (CDT) - %d Certificate(s)</summary><div class='details-content'>", cdt_data->certificate_count);
                 fprintf(f, "<table>\n<thead><tr><th>Attribute</th><th>Value</th></tr></thead>\n<tbody>\n");
                 fprintf(f, "<tr><td>OCSP Refresh</td><td>%s</td></tr>\n", cdt_data->ocspRefresh);
                 fprintf(f, "<tr><td>Certificate Count</td><td>%d</td></tr>\n", cdt_data->certificate_count);
